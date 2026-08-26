@@ -114,6 +114,8 @@ it is the difference between a decision and a habit.
 | [0008](docs/adr/0008-oversight-is-tiered-and-refusals-are-terminal.md) | Oversight is tiered, and a refusal is terminal |
 | [0009](docs/adr/0009-the-regulated-overlay.md) | One overlay module, not a fork |
 | [0010](docs/adr/0010-bounded-in-time.md) | Runs are bounded in time, not only in steps and spend |
+| [0011](docs/adr/0011-delegation-narrows.md) | Delegation narrows; it never widens |
+| [0012](docs/adr/0012-a-refusal-is-terminal-for-the-sub-run.md) | A refusal is terminal for the sub-run, not for the tree |
 
 ---
 
@@ -202,6 +204,39 @@ in an audit.
 
 ---
 
+## Delegation, and what a child may not have
+
+Both use cases this harness is built to carry are multi-agent: a coordinator
+hands sub-goals to workers, an adjudicator decides on what they bring back.
+
+The obvious implementation — a function that starts a second run — works on the
+first day and is a privilege-escalation path by the second. So the primitive is
+defined by what a child is *not* allowed to have.
+
+| Invariant | Why |
+|-----------|-----|
+| A principal may only narrow | Roles must be a subset of the parent's. Escalation by delegation is refused structurally, not reviewed for. |
+| Cost and time are drawn | Fungible — a dollar the child spends is a dollar the parent no longer has. Total spend across a tree of any shape stays bounded by the root. |
+| Steps are not drawn | Structural, not fungible. Capping a child at the parent's *remaining* steps would disable delegation exactly when a coordinator needs it. |
+| Depth belongs to the tree | Taken from the parent, so a branch cannot buy itself more room by asking on the way down. |
+| A delegation is one step | Not the child's twenty — otherwise one failed sub-run trips the parent's give-up ceiling on its own. |
+
+A purpose may be *added* where the parent declared none: under
+permissible-purpose authorisation a principal with no declared purpose is denied
+outright, so declaring one narrows. Changing one already declared does not.
+
+Budget exhaustion returns a named outcome. Privilege escalation **raises** —
+it is not a runtime condition but a defect in the calling service, and reporting
+it quietly as a failed run would let it ship.
+
+A refusal inside a sub-run is terminal *there* and an observation to the parent:
+a reviewer said no to that route, not to the objective. The opposing design,
+where a refusal anywhere kills the tree, makes any single cautious reviewer a
+denial of service on the root goal. ADR-0012 argues both sides, and names the
+risk this decision creates rather than pretending it has none.
+
+---
+
 ## Replay, through the real executor
 
 The question a regulated employer asks is not *"is your agent accurate."* It is:
@@ -262,8 +297,10 @@ A repository is defined as much by its refusals as by its contents.
 - **No production memory store.** The contracts and an in-memory reference
   implementation. Redis, Postgres or a vector database is a deployment decision,
   and one that varies by tier.
-- **No orchestration DAG.** Multi-agent topology is a legitimate problem and a
-  different one. A harness that also schedules is two products.
+- **No orchestration DAG.** The harness supplies delegation — one agent handing
+  a sub-goal to another under narrowed authority — and stops there. Deciding
+  *which* sub-goals exist, in what order, with what retries, is scheduling, and
+  a harness that also schedules is two products.
 - **No registry credentials in CI.** The container is built and smoke-tested,
   never pushed. Publishing is a release concern, and a CI job holding push
   credentials is a far larger blast radius than one without.
@@ -274,7 +311,7 @@ A repository is defined as much by its refusals as by its contents.
 
 | Check | Result |
 |-------|--------|
-| Tests | **198 passing** |
+| Tests | **225 passing** |
 | Coverage | **96.88%**, enforced as a CI gate, floor lives in `pyproject.toml` |
 | Type checking | `mypy --strict` clean across **28 source modules** |
 | Lint / format | `ruff check` + `ruff format --check` clean |
@@ -314,6 +351,13 @@ supervisor was asked to approve a call that policy then refused. Beyond wasting 
 reviewer's attention, it leaks the existence of tools the caller has no right to
 know about. → ADR-0008
 
+**Nothing could delegate below depth one.** `delegate()` built the child's
+context internally and never handed it back, so a sub-agent had no way to obtain
+its own context and delegate further. `max_delegation_depth=3` would have
+behaved exactly like 1 — the ceiling enforced by accident rather than by design.
+Found by trying to write a test for the depth ceiling and discovering the test
+could not be expressed. → ADR-0011
+
 ---
 
 ## Quick start
@@ -321,8 +365,8 @@ know about. → ADR-0008
 ```bash
 uv sync --extra dev
 
-uv run pytest                          # 198 tests, coverage gate
-uv run mypy                            # strict, 28 modules
+uv run pytest                          # 225 tests, coverage gate
+uv run mypy                            # strict, 29 modules
 uv run ruff check src tests
 ```
 

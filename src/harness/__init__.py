@@ -14,6 +14,7 @@ logging, correlation ids, tracing, the error contract and the CI gate. See
 docs/adr/0001.
 """
 
+from harness.delegation import PrivilegeEscalationError, delegate, new_child_context
 from harness.executor import run_agent
 from harness.gates import (
     ApprovalDecision,
@@ -110,6 +111,7 @@ __all__ = [
     "Planner",
     "PlannerState",
     "Principal",
+    "PrivilegeEscalationError",
     "Provenance",
     "PurposeAuthorization",
     "RateLimitExceededError",
@@ -138,6 +140,8 @@ __all__ = [
     "TraceError",
     "WallClockExceededError",
     "WorkingMemory",
+    "delegate",
+    "new_child_context",
     "record_trace",
     "regulated_overlay",
     "replay",

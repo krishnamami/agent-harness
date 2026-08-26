@@ -72,6 +72,7 @@ class RunLimits:
     max_consecutive_failures: int = 3
     max_wall_clock_seconds: float = 300.0
     default_tool_timeout_seconds: float = 30.0
+    max_delegation_depth: int = 3
 
     def __post_init__(self) -> None:
         if self.max_steps < 1:
@@ -84,6 +85,8 @@ class RunLimits:
             raise ValueError("max_wall_clock_seconds must be positive")
         if self.default_tool_timeout_seconds <= 0:
             raise ValueError("default_tool_timeout_seconds must be positive")
+        if self.max_delegation_depth < 0:
+            raise ValueError("max_delegation_depth cannot be negative")
         # Deliberately no cross-check that the per-call timeout fits inside the
         # run ceiling. `RunContext.timeout_for` clamps every call to whatever
         # the run has left, so a generous per-call default is already harmless
@@ -95,6 +98,7 @@ class StepKind(StrEnum):
     PLAN = "plan"
     APPROVAL = "approval"
     TOOL_CALL = "tool_call"
+    DELEGATION = "delegation"
     OBSERVATION = "observation"
     CORRECTION = "correction"
     FINISH = "finish"
@@ -134,12 +138,20 @@ class RunContext:
         tier: RiskTier = RiskTier.ROUTINE,
         run_id: str | None = None,
         metadata: dict[str, Any] | None = None,
+        depth: int = 0,
     ) -> None:
         self.run_id = run_id or str(uuid.uuid4())
         self.principal = principal
         self.limits = limits or RunLimits()
         self.tier = tier
         self.metadata = metadata or {}
+        self.depth = depth
+        # Results of runs delegated from this one, in the order they were
+        # started. The parent's own `steps` stay a record of the parent's own
+        # actions -- a delegation appears there as one step, not as the child's
+        # twenty, or the failure streak would count a single failed sub-run as
+        # twenty failures.
+        self.sub_runs: list[RunResult] = []
         self.steps: list[StepRecord] = []
         self.spent_usd = 0.0
         self._consecutive_failures = 0
@@ -226,6 +238,7 @@ class RunOutcome(StrEnum):
     STEP_LIMIT = "step_limit"
     COST_LIMIT = "cost_limit"
     TIME_LIMIT = "time_limit"
+    DEPTH_LIMIT = "depth_limit"
     GAVE_UP = "gave_up"
     DENIED = "denied"
     # A human said no. Distinct from DENIED, which is policy refusing a call

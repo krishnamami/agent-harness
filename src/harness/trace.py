@@ -106,6 +106,7 @@ class RunTrace:
                 "max_consecutive_failures": self.limits.max_consecutive_failures,
                 "max_wall_clock_seconds": self.limits.max_wall_clock_seconds,
                 "default_tool_timeout_seconds": self.limits.default_tool_timeout_seconds,
+                "max_delegation_depth": self.limits.max_delegation_depth,
             },
             "provenance": {
                 "recorded_at": self.provenance.recorded_at,
@@ -157,6 +158,7 @@ class RunTrace:
                 # cannot read its own history is not an audit record.
                 max_wall_clock_seconds=lim.get("max_wall_clock_seconds", 300.0),
                 default_tool_timeout_seconds=lim.get("default_tool_timeout_seconds", 30.0),
+                max_delegation_depth=lim.get("max_delegation_depth", 3),
             ),
             steps=tuple(
                 StepRecord(
