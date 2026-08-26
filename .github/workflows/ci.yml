@@ -1,0 +1,171 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# A new push to the same branch makes the previous run irrelevant. Cancelling it
+# frees a runner and stops people reading stale red crosses.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+# Least privilege by default. A job that needs more declares it itself.
+permissions:
+  contents: read
+
+env:
+  PYTHON_VERSION: "3.12"
+  UV_VERSION: "0.8.17"
+
+jobs:
+  # --------------------------------------------------------------------
+  # Fast feedback. Runs in under a minute and catches most of what breaks.
+  # --------------------------------------------------------------------
+  quality:
+    name: Lint and type check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: true
+
+      - name: Install
+        run: uv sync --locked --extra dev
+
+      - name: Lint
+        run: uv run ruff check src tests --output-format=github
+
+      - name: Format
+        run: uv run ruff format --check src tests
+
+      - name: Type check
+        run: uv run mypy
+
+  # --------------------------------------------------------------------
+  # The gate. Coverage below the floor in pyproject.toml fails the build --
+  # the threshold lives with the project, not in this file, so it cannot
+  # drift between local runs and CI.
+  # --------------------------------------------------------------------
+  test:
+    name: Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: true
+
+      - name: Install
+        run: uv sync --locked --extra dev
+
+      - name: Test
+        run: uv run pytest --cov-report=xml --cov-report=term-missing
+
+      - name: Upload coverage
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage
+          path: coverage.xml
+          retention-days: 7
+
+  # --------------------------------------------------------------------
+  # Supply chain. Separate from `quality` so a CVE disclosed overnight is
+  # reported as its own failure rather than looking like a lint error.
+  # --------------------------------------------------------------------
+  security:
+    name: Security scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # gitleaks needs history to scan commits, not just the tree.
+          fetch-depth: 0
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: true
+
+      # Audits the exported lockfile, not the installed environment: that is
+      # exactly the set of packages that ships in the container, it excludes
+      # dev tooling that never reaches production, and it avoids pip-audit
+      # trying and failing to look up this project on PyPI.
+      - name: Audit dependencies for known vulnerabilities
+        run: |
+          uv export --no-dev --no-emit-project --format requirements-txt -o requirements.audit.txt
+          uv run --with pip-audit pip-audit --strict \
+            --requirement requirements.audit.txt --progress-spinner off
+
+      # Run from the image rather than gitleaks-action, which requires a paid
+      # licence key when the repository belongs to an organisation. This works
+      # the same under a personal account or an org.
+      - name: Scan history for committed secrets
+        run: |
+          docker run --rm -v "$PWD:/repo" ghcr.io/gitleaks/gitleaks:latest \
+            detect --source /repo --redact --no-banner
+
+  # --------------------------------------------------------------------
+  # Proves the image still builds. Not pushed -- publishing is a release
+  # concern, and a CI job with registry credentials is a much larger blast
+  # radius than one without.
+  # --------------------------------------------------------------------
+  build:
+    name: Container build
+    runs-on: ubuntu-latest
+    needs: [quality, test]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: runtime
+          push: false
+          load: true
+          tags: ai-golden-path:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Smoke test the image
+        run: |
+          docker run -d --name smoke -p 8000:8000 \
+            -e APP_ENVIRONMENT=dev -e APP_LOG_FORMAT=json ai-golden-path:ci
+          for i in $(seq 1 20); do
+            if curl -sf localhost:8000/health > /dev/null; then
+              echo "service is up"; break
+            fi
+            sleep 1
+          done
+          curl -sf localhost:8000/health | tee /dev/stderr | grep -q '"status":"ok"'
+          curl -sf localhost:8000/ready  | grep -q '"status":"ready"'
+          echo "--- container logs ---"
+          docker logs smoke
+          docker rm -f smoke
+
+  # --------------------------------------------------------------------
+  # One required check to protect the branch with, instead of five that
+  # have to be kept in sync with the branch protection rule by hand.
+  # --------------------------------------------------------------------
+  ci:
+    name: CI
+    runs-on: ubuntu-latest
+    needs: [quality, test, security, build]
+    if: always()
+    steps:
+      - name: Verify every job passed
+        run: |
+          if echo '${{ toJSON(needs) }}' | grep -q '"result": *"\(failure\|cancelled\)"'; then
+            echo "one or more jobs failed"; exit 1
+          fi
+          echo "all jobs passed"

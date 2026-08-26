@@ -1,0 +1,19 @@
+# Normalise line endings to LF everywhere, including in Windows working copies.
+#
+# Without this, git converts to CRLF on checkout on Windows. Python tolerates
+# that; Linux does not. A shell script with CRLF endings gets a carriage return
+# appended to its shebang and the container reports:
+#
+#     /bin/sh^M: bad interpreter: No such file or directory
+#
+# A template that is cloned on Windows and runs on Linux has to pin this, or
+# it breaks for exactly the people who did nothing wrong.
+* text=auto eol=lf
+
+# Never touched, whatever the heuristic thinks.
+*.png binary
+*.jpg binary
+*.ico binary
+*.pdf binary
+*.gz binary
+*.zip binary

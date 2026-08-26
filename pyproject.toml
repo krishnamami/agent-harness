@@ -1,0 +1,58 @@
+[project]
+name = "agent-harness"
+version = "0.1.0"
+description = "Enterprise agent harness: the fabric agents run inside. Bounded execution, a governed tool registry, tiered memory, and deterministic replay."
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.32",
+    "pydantic>=2.9",
+    "pydantic-settings>=2.6",
+    "opentelemetry-sdk>=1.29",
+    "opentelemetry-exporter-otlp-proto-http>=1.29",
+    "opentelemetry-instrumentation-fastapi>=0.50b0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.3",
+    "pytest-cov>=6.0",
+    "httpx>=0.27",
+    "pytest-asyncio>=0.24",
+    "ruff>=0.8",
+    "mypy>=1.13",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/app", "src/evals", "src/harness"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "UP", "B", "A", "C4", "SIM", "ARG", "PTH", "RUF"]
+
+[tool.ruff.lint.per-file-ignores]
+# Test doubles must match the interface they stand in for, so unused
+# arguments are the point rather than an oversight.
+"tests/**" = ["ARG002", "ARG001"]
+# Reference policy implementations must match the protocol signature they
+# stand in for; an argument one of them ignores is the point, not an oversight.
+"src/harness/policy.py" = ["ARG002"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+addopts = "-q --cov=app --cov=evals --cov=harness --cov-report=term-missing --cov-fail-under=70"
+asyncio_mode = "auto"
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+files = ["src"]
