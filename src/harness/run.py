@@ -154,7 +154,7 @@ class RunContext:
         # actions -- a delegation appears there as one step, not as the child's
         # twenty, or the failure streak would count a single failed sub-run as
         # twenty failures.
-        self.sub_runs: list[RunResult] = []
+        self.sub_runs: list[SubRun] = []
         self.steps: list[StepRecord] = []
         self.spent_usd = 0.0
         self._consecutive_failures = 0
@@ -249,6 +249,28 @@ class RunOutcome(StrEnum):
     # rephrases until someone approves is worse than no gate at all.
     NOT_APPROVED = "not_approved"
     FAILED = "failed"
+
+
+@dataclass(frozen=True)
+class SubRun:
+    """A delegated run, kept whole.
+
+    The parent holds the child's *context* as well as its result, because a
+    result alone cannot be turned into a trace: the limits that were in force,
+    the principal it ran as and the tier it ran at all live on the context, and
+    those are most of what makes a trace worth keeping.
+
+    Keeping only the result was the original design, and it made every
+    delegated run unexplainable -- which contradicted ADR-0007 from inside
+    ADR-0011. See ADR-0016.
+    """
+
+    context: RunContext
+    result: RunResult
+
+    @property
+    def goal(self) -> str:
+        return str(self.context.metadata.get("sub_goal", ""))
 
 
 @dataclass(frozen=True)

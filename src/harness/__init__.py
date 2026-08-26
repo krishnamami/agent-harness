@@ -68,6 +68,7 @@ from harness.run import (
     StepKind,
     StepLimitExceededError,
     StepRecord,
+    SubRun,
     WallClockExceededError,
 )
 from harness.tools import (
@@ -133,6 +134,7 @@ __all__ = [
     "StepKind",
     "StepLimitExceededError",
     "StepRecord",
+    "SubRun",
     "TierGate",
     "Tool",
     "ToolDeniedError",

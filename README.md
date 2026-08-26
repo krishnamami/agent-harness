@@ -119,6 +119,7 @@ it is the difference between a decision and a habit.
 | [0013](docs/adr/0013-a-batch-of-calls-is-one-intent.md) | A batch of calls is one intent |
 | [0014](docs/adr/0014-the-harness-emits-spans-the-service-exports-them.md) | The harness emits spans; the service exports them |
 | [0015](docs/adr/0015-benchmarks-measure-the-harness.md) | Benchmarks measure the harness, not an agent |
+| [0016](docs/adr/0016-a-delegated-run-is-traceable.md) | A delegated run is traceable, and the tree is one record |
 
 ---
 
@@ -316,6 +317,18 @@ not a simulator. That distinction is the entire value. A simulator proves your
 simulator works; replaying through the production loop proves the production
 loop still produces the recorded outcome.
 
+A tree is one record. `record_trace` recurses into delegated runs, so a
+coordinator's trace contains its workers' traces nested inside it rather than
+scattered across sibling records that have to be reassembled correctly before
+they can be read. `walk()` yields every run in the tree.
+
+Replay stays **per run**, deliberately. The harness never chose to delegate —
+the service did, and a planner has no way to express delegation as a decision
+(ADR-0004 is why it must not). Claiming to replay a tree would be claiming to
+replay code the harness has never seen. What it guarantees is narrower and
+true: every run in the tree is recorded, and every run in the tree is
+individually replayable.
+
 And replay reports **divergence** rather than merely passing. If today's code
 would not reproduce March's run, that is the finding — and it is considerably
 more interesting than a confirmation.
@@ -425,8 +438,8 @@ A repository is defined as much by its refusals as by its contents.
 
 | Check | Result |
 |-------|--------|
-| Tests | **261 passing** |
-| Coverage | **97.14%**, enforced as a CI gate, floor lives in `pyproject.toml` |
+| Tests | **265 passing** |
+| Coverage | **97.16%**, enforced as a CI gate, floor lives in `pyproject.toml` |
 | Type checking | `mypy --strict` clean across **28 source modules** |
 | Lint / format | `ruff check` + `ruff format --check` clean |
 | Supply chain | `pip-audit --strict` against the exported lockfile — no known vulnerabilities |
@@ -481,6 +494,14 @@ refusing. Broken since the trace format was written, and invisible because
 nothing had needed metadata to survive a round trip until batching did.
 → ADR-0013
 
+**A delegated run could not be traced at all.** `delegate()` kept only the
+child's `RunResult` — which carries steps and cost, but not the limits in force,
+the principal it acted as, or the tier it ran at. Those live on the
+`RunContext`, which `delegate()` created internally and dropped. So the parent's
+record pointed at a `child_run_id` that resolved to nothing, and ADR-0011
+contradicted ADR-0007 from the inside. Found while preparing to tag `v1.0.0`,
+which is the right moment to find it and a bad one to ship it. → ADR-0016
+
 **Batching would have been a route around the audit policy.** Redaction keyed
 off `step.tool_name`, which is `None` on a batched plan because the calls live
 in metadata. Same tool, same arguments, recorded in full because they arrived
@@ -494,7 +515,7 @@ than by testing the batch on its own. → ADR-0013
 ```bash
 uv sync --extra dev
 
-uv run pytest                          # 261 tests, coverage gate
+uv run pytest                          # 265 tests, coverage gate
 uv run mypy                            # strict, 30 modules
 uv run ruff check src tests
 ```

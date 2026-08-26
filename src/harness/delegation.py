@@ -60,6 +60,7 @@ from harness.run import (
     RunResult,
     StepKind,
     StepRecord,
+    SubRun,
 )
 from harness.spans import DELEGATE, record_error, tracer
 from harness.tools import ToolRegistry
@@ -212,7 +213,13 @@ async def delegate(
         span.set_attribute("harness.depth", parent.depth + 1)
 
         child = new_child_context(
-            parent, principal=principal, limits=limits, tier=tier, metadata=metadata
+            parent,
+            principal=principal,
+            limits=limits,
+            tier=tier,
+            # The goal travels with the context, so the child's trace can say
+            # what it was for without the parent having to be consulted.
+            metadata={**(metadata or {}), "sub_goal": sub_goal},
         )
         if isinstance(child, RunOutcome):
             record_error(span, "refused", str(child))
@@ -238,7 +245,10 @@ async def delegate(
         result = await run_agent(sub_goal, planner, registry, child, gate)
         span.set_attribute("harness.child.outcome", str(result.outcome))
 
-    parent.sub_runs.append(result)
+    # Context *and* result. A result alone cannot be turned into a trace, and a
+    # delegated run that cannot be traced is exactly what ADR-0007 says must not
+    # exist. See ADR-0016.
+    parent.sub_runs.append(SubRun(context=child, result=result))
 
     # One step, carrying the child's whole cost. Recording it through the
     # parent's own `record` is what charges the parent: a delegation the parent

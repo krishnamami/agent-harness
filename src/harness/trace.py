@@ -28,6 +28,7 @@ from __future__ import annotations
 import hashlib
 import json
 import time
+from collections.abc import Iterator
 from dataclasses import dataclass, field, replace
 from typing import Any
 
@@ -88,6 +89,23 @@ class RunTrace:
     cost_usd: float
     provenance: Provenance
     output: Any = None
+    # Traces of the runs this one delegated, in the order they were started.
+    # Nested rather than flat: the tree is the thing being explained, and a
+    # list of sibling traces with a parent id in each is a tree you have to
+    # reassemble correctly before you can read it.
+    sub_traces: tuple[RunTrace, ...] = ()
+
+    def walk(self) -> Iterator[RunTrace]:
+        """This trace and every trace beneath it, depth first.
+
+        Replay operates on one run at a time -- the harness never *chose* to
+        delegate, the service did, so reproducing the tree's shape is the
+        service's job. What the harness can guarantee is that every run in the
+        tree is individually replayable, and this is how you reach them.
+        """
+        yield self
+        for child in self.sub_traces:
+            yield from child.walk()
 
     # ------------------------------------------------------------ serialise
     def to_dict(self) -> dict[str, Any]:
@@ -134,6 +152,7 @@ class RunTrace:
                 }
                 for s in self.steps
             ],
+            "sub_traces": [t.to_dict() for t in self.sub_traces],
         }
 
     def to_json(self) -> str:
@@ -185,6 +204,11 @@ class RunTrace:
             outcome=RunOutcome(data["outcome"]),
             cost_usd=data["cost_usd"],
             output=data.get("output"),
+            sub_traces=tuple(
+                # `.get`, so a trace recorded before delegation existed loads.
+                cls.from_dict(child)
+                for child in data.get("sub_traces", [])
+            ),
             provenance=Provenance(
                 recorded_at=p["recorded_at"],
                 trace_format=version,
@@ -259,6 +283,15 @@ def record_trace(
                 {"description": spec.description, "parameters": spec.parameters}
             )
 
+    # Recorded depth first, with the same registry and audit policy. A service
+    # that gave a child a *different* registry should record that child's trace
+    # itself; the harness records what it can see, and says so rather than
+    # inventing provenance it cannot vouch for.
+    sub_traces = tuple(
+        record_trace(sub.goal, sub.context, sub.result, registry, audit=audit)
+        for sub in ctx.sub_runs
+    )
+
     return RunTrace(
         run_id=result.run_id,
         goal=goal,
@@ -269,6 +302,7 @@ def record_trace(
         outcome=result.outcome,
         cost_usd=result.cost_usd,
         output=result.output,
+        sub_traces=sub_traces,
         provenance=Provenance(
             recorded_at=time.time(),
             authorization_policy=policy_name,

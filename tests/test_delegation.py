@@ -20,13 +20,17 @@ from harness import (
     RunContext,
     RunLimits,
     RunOutcome,
+    RunResult,
+    RunTrace,
     ScriptedPlanner,
     StepKind,
     StepRecord,
+    SubRun,
     ToolRegistry,
     ToolSpec,
     delegate,
     new_child_context,
+    record_trace,
 )
 
 OBJ = {"type": "object", "properties": {}}
@@ -62,7 +66,18 @@ def _charge(ctx: RunContext, usd: float) -> None:
     )
 
 
-DONE = ScriptedPlanner
+def _as_result(ctx: RunContext, _unused=None) -> RunResult:
+    """The parent's own RunResult, as the executor would have built it.
+
+    These tests drive `delegate` directly rather than through a planner, so
+    there is no `run_agent` to produce one.
+    """
+    return RunResult(
+        run_id=ctx.run_id,
+        outcome=RunOutcome.COMPLETED,
+        steps=tuple(ctx.steps),
+        cost_usd=ctx.spent_usd,
+    )
 
 
 # ------------------------------------------------------------------ narrowing
@@ -265,7 +280,9 @@ async def test_the_childs_cost_is_charged_to_the_parent():
 async def test_the_parent_keeps_the_childs_result():
     parent = _parent()
     result = await delegate(parent, "sub", ScriptedPlanner(Finish(output="x")), _registry())
-    assert parent.sub_runs == [result]
+    (sub,) = parent.sub_runs
+    assert sub.result == result
+    assert sub.context.depth == 1
 
 
 async def test_the_delegation_step_links_to_the_child_run():
@@ -367,3 +384,66 @@ async def test_a_parent_out_of_steps_starts_no_child():
 
     assert result.outcome is RunOutcome.STEP_LIMIT
     assert parent.sub_runs == []
+
+
+# -------------------------------------------------------------- the tree's record
+async def test_a_delegated_run_can_be_traced():
+    # The defect this closes. Keeping only the child's `RunResult` left its
+    # limits, principal and tier on a context nobody held any more -- so a
+    # delegated run could not be turned into a trace at all, and ADR-0011
+    # quietly contradicted ADR-0007 from the inside.
+    registry = _registry()
+    parent = _parent()
+    result = await delegate(
+        parent,
+        "check the income documents",
+        ScriptedPlanner(CallTool(tool="t", arguments={}), Finish(output="cleared")),
+        registry,
+    )
+
+    trace = record_trace("resolve the file", parent, _as_result(parent, result), registry)
+
+    (child,) = trace.sub_traces
+    assert child.goal == "check the income documents"
+    assert child.run_id == result.run_id
+    assert child.outcome is RunOutcome.COMPLETED
+    assert len(child.steps) == len(result.steps)
+
+
+async def test_the_whole_tree_survives_serialisation():
+    registry = _registry()
+    parent = _parent()
+    result = await delegate(parent, "sub", ScriptedPlanner(Finish(output="x")), registry)
+    trace = record_trace("root", parent, _as_result(parent, result), registry)
+
+    restored = RunTrace.from_dict(trace.to_dict())
+
+    assert len(restored.sub_traces) == 1
+    assert restored.sub_traces[0].run_id == result.run_id
+
+
+async def test_walk_reaches_every_run_in_the_tree():
+    # Replay works on one run at a time -- the harness never chose to delegate,
+    # the service did -- so what it guarantees is that every run in the tree is
+    # individually reachable and individually replayable.
+    registry = _registry()
+    parent = _parent()
+    a = new_child_context(parent)
+    await delegate(a, "grandchild", ScriptedPlanner(Finish(output="deep")), registry)
+    await delegate(parent, "child", ScriptedPlanner(Finish(output="x")), registry)
+    parent.sub_runs.append(SubRun(context=a, result=_as_result(a, None)))
+
+    trace = record_trace("root", parent, _as_result(parent, None), registry)
+
+    assert len(list(trace.walk())) == 4
+
+
+async def test_a_trace_recorded_before_delegation_existed_still_loads():
+    registry = _registry()
+    parent = _parent()
+    result = await delegate(parent, "sub", ScriptedPlanner(Finish(output="x")), registry)
+    data = record_trace("root", parent, _as_result(parent, result), registry).to_dict()
+
+    del data["sub_traces"]
+
+    assert RunTrace.from_dict(data).sub_traces == ()
