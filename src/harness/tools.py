@@ -103,6 +103,12 @@ class ToolRegistry:
             raise ValueError(f"tool {spec.name!r} is already registered")
         self._tools[spec.name] = _Registered(spec=spec, fn=fn)
 
+    @property
+    def authorization(self) -> AuthorizationPolicy:
+        """The policy in force. Read-only — swapping it mid-run would mean
+        different calls in the same run were judged by different rules."""
+        return self._authorization
+
     def __contains__(self, name: object) -> bool:
         return name in self._tools
 
@@ -140,7 +146,18 @@ class ToolRegistry:
         return visible
 
     # --------------------------------------------------------------- invoke
-    async def invoke(self, name: str, arguments: dict[str, Any], principal: Principal) -> Any:
+    def check(self, name: str, arguments: dict[str, Any], principal: Principal) -> ToolSpec:
+        """Everything that must pass before a tool runs -- without running it.
+
+        Separated from `invoke` so that "would this call be permitted" can be
+        answered without the side effect. A dry run, a pre-flight check and a
+        replay all need the policy without the action, and a replay that
+        skipped the policy could not tell you whether a run permitted in March
+        would still be permitted today.
+
+        Raises rather than returning a verdict: a caller that ignores a
+        returned boolean is a bug that looks like working code.
+        """
         if name not in self._tools:
             raise ToolNotFoundError(name)
         entry = self._tools[name]
@@ -150,7 +167,11 @@ class ToolRegistry:
             raise ToolDeniedError(name, decision.reason or "denied by policy")
 
         self._check_rate_limit(entry)
-        return await entry.fn(arguments)
+        return entry.spec
+
+    async def invoke(self, name: str, arguments: dict[str, Any], principal: Principal) -> Any:
+        self.check(name, arguments, principal)
+        return await self._tools[name].fn(arguments)
 
     def _check_rate_limit(self, entry: _Registered) -> None:
         limit = entry.spec.rate_limit_per_minute

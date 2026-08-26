@@ -60,6 +60,15 @@ from harness.tools import (
     ToolRegistry,
     ToolSpec,
 )
+from harness.trace import (
+    Divergence,
+    Provenance,
+    ReplayReport,
+    RunTrace,
+    TraceError,
+    record_trace,
+    replay,
+)
 
 __all__ = [
     "AuditPolicy",
@@ -68,6 +77,7 @@ __all__ = [
     "CallTool",
     "CostLimitExceededError",
     "Decision",
+    "Divergence",
     "Finish",
     "InMemoryStore",
     "LimitExceededError",
@@ -79,13 +89,16 @@ __all__ = [
     "Planner",
     "PlannerState",
     "Principal",
+    "Provenance",
     "RateLimitExceededError",
+    "ReplayReport",
     "RiskTier",
     "RoleBasedAuthorization",
     "RunContext",
     "RunLimits",
     "RunOutcome",
     "RunResult",
+    "RunTrace",
     "ScriptedPlanner",
     "StandardAudit",
     "StepKind",
@@ -96,6 +109,9 @@ __all__ = [
     "ToolNotFoundError",
     "ToolRegistry",
     "ToolSpec",
+    "TraceError",
     "WorkingMemory",
+    "record_trace",
+    "replay",
     "run_agent",
 ]

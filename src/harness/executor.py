@@ -139,6 +139,12 @@ async def run_agent(
                 index=ctx.step_count,
                 kind=StepKind.PLAN,
                 summary=decision.rationale or f"call {decision.tool}",
+                # The intent is recorded here, before the ceilings are checked.
+                # A decision formed and then prevented is the thing an auditor
+                # asks about, and recording it only on the TOOL_CALL step means
+                # a run stopped by a ceiling loses its final intention.
+                tool_name=decision.tool,
+                arguments=decision.arguments,
                 cost_usd=decision.cost_usd,
                 duration_ms=plan_ms,
             )
