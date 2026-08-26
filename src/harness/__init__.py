@@ -14,6 +14,15 @@ logging, correlation ids, tracing, the error contract and the CI gate. See
 docs/adr/0001.
 """
 
+from harness.executor import run_agent
+from harness.planner import (
+    CallTool,
+    Decision,
+    Finish,
+    Planner,
+    PlannerState,
+    ScriptedPlanner,
+)
 from harness.policy import (
     AuditPolicy,
     AuthorizationDecision,
@@ -48,9 +57,14 @@ __all__ = [
     "AuditPolicy",
     "AuthorizationDecision",
     "AuthorizationPolicy",
+    "CallTool",
     "CostLimitExceededError",
+    "Decision",
+    "Finish",
     "LimitExceededError",
     "OpenAuthorization",
+    "Planner",
+    "PlannerState",
     "Principal",
     "RateLimitExceededError",
     "RiskTier",
@@ -59,6 +73,7 @@ __all__ = [
     "RunLimits",
     "RunOutcome",
     "RunResult",
+    "ScriptedPlanner",
     "StandardAudit",
     "StepKind",
     "StepLimitExceededError",
@@ -68,4 +83,5 @@ __all__ = [
     "ToolNotFoundError",
     "ToolRegistry",
     "ToolSpec",
+    "run_agent",
 ]

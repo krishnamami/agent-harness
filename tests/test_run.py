@@ -122,3 +122,30 @@ def test_result_exposes_the_tool_calls():
 def test_a_bounded_run_is_not_a_successful_run():
     r = RunResult(run_id="r", outcome=RunOutcome.STEP_LIMIT)
     assert not r.succeeded
+
+
+# ------------------------------------------------------- regression: streaks
+def test_a_planning_step_does_not_reset_the_failure_streak():
+    """Regression.
+
+    The loop records a PLAN before every TOOL_CALL. The first version reset
+    the streak on any successful step, so the counter oscillated between every
+    failed call and the give-up ceiling was never reached — a runaway agent
+    burned its whole step budget instead of stopping after three failures.
+    """
+    ctx = RunContext(P, RunLimits(max_consecutive_failures=3))
+    for i in range(3):
+        ctx.record(StepRecord(index=i * 2, kind=StepKind.PLAN, summary="thinking"))
+        ctx.record(_step(i * 2 + 1, error="boom"))
+    assert ctx.consecutive_failures == 3
+    assert ctx.should_give_up()
+
+
+def test_a_successful_action_still_resets_the_streak():
+    ctx = RunContext(P, RunLimits(max_consecutive_failures=3))
+    ctx.record(_step(0, error="boom"))
+    ctx.record(_step(1, error="boom"))
+    ctx.record(StepRecord(index=2, kind=StepKind.PLAN, summary="thinking"))
+    assert ctx.consecutive_failures == 2
+    ctx.record(_step(3))
+    assert ctx.consecutive_failures == 0

@@ -45,6 +45,7 @@ select = ["E", "F", "I", "N", "UP", "B", "A", "C4", "SIM", "ARG", "PTH", "RUF"]
 # Reference policy implementations must match the protocol signature they
 # stand in for; an argument one of them ignores is the point, not an oversight.
 "src/harness/policy.py" = ["ARG002"]
+"src/harness/planner.py" = ["ARG002"]
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]

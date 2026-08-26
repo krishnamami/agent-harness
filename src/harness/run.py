@@ -133,6 +133,18 @@ class RunContext:
     def record(self, step: StepRecord) -> None:
         self.steps.append(step)
         self.spent_usd += step.cost_usd
+
+        # Only *actions* move the failure streak. Planning is neutral.
+        #
+        # This is not a detail. Each loop iteration records a PLAN step and
+        # then a TOOL_CALL step, so if a successful plan reset the streak the
+        # counter would oscillate 0-1-0-1 between every failed call and the
+        # give-up ceiling would never be reached. A runaway agent would burn
+        # its entire step budget instead of stopping after three failures.
+        # We shipped that and the test below caught it.
+        if step.kind is StepKind.PLAN:
+            return
+
         if step.failed:
             self._consecutive_failures += 1
         else:
