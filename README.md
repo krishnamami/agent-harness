@@ -116,6 +116,7 @@ it is the difference between a decision and a habit.
 | [0010](docs/adr/0010-bounded-in-time.md) | Runs are bounded in time, not only in steps and spend |
 | [0011](docs/adr/0011-delegation-narrows.md) | Delegation narrows; it never widens |
 | [0012](docs/adr/0012-a-refusal-is-terminal-for-the-sub-run.md) | A refusal is terminal for the sub-run, not for the tree |
+| [0013](docs/adr/0013-a-batch-of-calls-is-one-intent.md) | A batch of calls is one intent |
 
 ---
 
@@ -134,6 +135,8 @@ it detects after the money is spent.
 | `max_consecutive_failures` | 3 | A flaky downstream should not consume the whole step budget |
 | `max_wall_clock_seconds` | 300 | The only bound that catches a hang rather than a loop |
 | `default_tool_timeout_seconds` | 30 | Per tool, overridable on the `ToolSpec` |
+| `max_parallel_calls` | 8 | A planner asking for five hundred concurrent calls is a runaway too |
+| `max_delegation_depth` | 3 | Bounds the tree, not any run in it |
 
 The last two are the ones most harnesses omit, and omitting them makes the
 whole claim conditional. Step and cost ceilings only fire when the loop turns,
@@ -201,6 +204,31 @@ months later.
 so *"nobody looked because it was below the threshold"* and *"somebody looked and
 said yes"* are distinguishable in the record. They are very different sentences
 in an audit.
+
+---
+
+## Parallel calls, without giving anything up
+
+Every model tool-use API returns several calls per turn. A loop that carries
+one forces three independent lookups into three planning round-trips and pays
+three times the latency for work that has no ordering between it at all.
+
+The concurrency is the easy part. What is not easy is keeping the rest of the
+harness true once calls stop happening one at a time:
+
+- **One intent, one `PLAN` step.** A plan step per call would claim the planner
+  took three turns, and a replay built from that record would take three too.
+- **Afforded as a whole.** Projected cost is the sum, checked before anything
+  runs, because cost cannot be un-spent.
+- **Authorised per call.** A denial spends nothing, so the permitted calls
+  still run and the planner learns both facts in one turn.
+- **Gated as a whole.** A refusal anywhere stops the batch — "terminal except
+  for the other three calls asked for in the same breath" is not terminal.
+- **Recorded in the order declared.** `gather`, not `as_completed`: completion
+  order is a property of the network on the day, and a trace that reflected it
+  would not replay to the same thing twice.
+- **Bounded.** `max_parallel_calls` caps the fan-out; an over-wide batch is a
+  recorded correction the planner can act on, not a crash.
 
 ---
 
@@ -311,8 +339,8 @@ A repository is defined as much by its refusals as by its contents.
 
 | Check | Result |
 |-------|--------|
-| Tests | **225 passing** |
-| Coverage | **96.88%**, enforced as a CI gate, floor lives in `pyproject.toml` |
+| Tests | **244 passing** |
+| Coverage | **97.11%**, enforced as a CI gate, floor lives in `pyproject.toml` |
 | Type checking | `mypy --strict` clean across **28 source modules** |
 | Lint / format | `ruff check` + `ruff format --check` clean |
 | Supply chain | `pip-audit --strict` against the exported lockfile — no known vulnerabilities |
@@ -358,6 +386,21 @@ behaved exactly like 1 — the ceiling enforced by accident rather than by desig
 Found by trying to write a test for the depth ceiling and discovering the test
 could not be expressed. → ADR-0011
 
+**A guard that evaporated on serialisation.** `RunTrace.to_dict` wrote every
+field of a step except `metadata` — and `arguments_withheld`, the marker that
+makes a redacted trace refuse to replay, lives in metadata. So the guard held
+in memory and vanished the moment a trace was written to disk and read back: a
+reloaded trace replayed withheld arguments as an empty dict instead of
+refusing. Broken since the trace format was written, and invisible because
+nothing had needed metadata to survive a round trip until batching did.
+→ ADR-0013
+
+**Batching would have been a route around the audit policy.** Redaction keyed
+off `step.tool_name`, which is `None` on a batched plan because the calls live
+in metadata. Same tool, same arguments, recorded in full because they arrived
+in a list. Found by asking what a batch does to an existing mechanism rather
+than by testing the batch on its own. → ADR-0013
+
 ---
 
 ## Quick start
@@ -365,7 +408,7 @@ could not be expressed. → ADR-0011
 ```bash
 uv sync --extra dev
 
-uv run pytest                          # 225 tests, coverage gate
+uv run pytest                          # 244 tests, coverage gate
 uv run mypy                            # strict, 29 modules
 uv run ruff check src tests
 ```

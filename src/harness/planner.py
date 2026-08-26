@@ -46,6 +46,34 @@ class CallTool:
 
 
 @dataclass(frozen=True)
+class CallTools:
+    """Intent: invoke several tools at once, because none depends on another.
+
+    Every current model tool-use API can return more than one call per turn,
+    and a planner that has to serialise three independent lookups into three
+    turns pays three times the planning latency for no reason.
+
+    The batch is one intent, not several. It is recorded as one `PLAN` step,
+    it is afforded or refused as a whole, and it is replayed as a whole -- and
+    its results are recorded in the order declared here, never the order they
+    happened to finish in.
+    """
+
+    calls: tuple[CallTool, ...]
+    rationale: str = ""
+    cost_usd: float = 0.0  # cost of producing this decision
+
+    def __post_init__(self) -> None:
+        if not self.calls:
+            raise ValueError("a parallel batch needs at least one call")
+
+    @property
+    def estimated_cost_usd(self) -> float:
+        """What the whole batch is expected to cost."""
+        return sum(c.estimated_cost_usd for c in self.calls)
+
+
+@dataclass(frozen=True)
 class Finish:
     """Intent: stop, with this output."""
 
@@ -54,7 +82,7 @@ class Finish:
     cost_usd: float = 0.0
 
 
-Decision = CallTool | Finish
+Decision = CallTool | CallTools | Finish
 
 
 @dataclass(frozen=True)

@@ -73,6 +73,7 @@ class RunLimits:
     max_wall_clock_seconds: float = 300.0
     default_tool_timeout_seconds: float = 30.0
     max_delegation_depth: int = 3
+    max_parallel_calls: int = 8
 
     def __post_init__(self) -> None:
         if self.max_steps < 1:
@@ -87,6 +88,8 @@ class RunLimits:
             raise ValueError("default_tool_timeout_seconds must be positive")
         if self.max_delegation_depth < 0:
             raise ValueError("max_delegation_depth cannot be negative")
+        if self.max_parallel_calls < 1:
+            raise ValueError("max_parallel_calls must be at least 1")
         # Deliberately no cross-check that the per-call timeout fits inside the
         # run ceiling. `RunContext.timeout_for` clamps every call to whatever
         # the run has left, so a generous per-call default is already harmless

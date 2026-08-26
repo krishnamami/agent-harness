@@ -41,6 +41,7 @@ from harness.overlays import (
 )
 from harness.planner import (
     CallTool,
+    CallTools,
     Decision,
     Finish,
     Planner,
@@ -96,6 +97,7 @@ __all__ = [
     "AuthorizationPolicy",
     "AutoApprove",
     "CallTool",
+    "CallTools",
     "CostLimitExceededError",
     "Decision",
     "Divergence",

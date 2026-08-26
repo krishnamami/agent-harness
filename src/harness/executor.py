@@ -12,10 +12,11 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from dataclasses import replace
 from typing import Any
 
 from harness.gates import ApprovalGate, ApprovalRequest, AutoApprove
-from harness.planner import CallTool, Finish, Planner, PlannerState
+from harness.planner import CallTool, CallTools, Finish, Planner, PlannerState
 from harness.run import (
     CostLimitExceededError,
     RunContext,
@@ -163,57 +164,68 @@ async def run_agent(
             )
             return _result(ctx, RunOutcome.COMPLETED, output=decision.output)
 
-        # --- a tool call ------------------------------------------------
-        ctx.record(
-            StepRecord(
-                index=ctx.step_count,
-                kind=StepKind.PLAN,
-                summary=decision.rationale or f"call {decision.tool}",
-                # The intent is recorded here, before the ceilings are checked.
-                # A decision formed and then prevented is the thing an auditor
-                # asks about, and recording it only on the TOOL_CALL step means
-                # a run stopped by a ceiling loses its final intention.
-                tool_name=decision.tool,
-                arguments=decision.arguments,
-                cost_usd=decision.cost_usd,
-                duration_ms=plan_ms,
-            )
-        )
-
-        # Projected cost is checked before the call, not after. A run that
-        # discovers it is over budget has already spent it.
-        try:
-            ctx.before_step(projected_cost_usd=decision.estimated_cost_usd)
-        except WallClockExceededError as exc:
-            return _result(ctx, RunOutcome.TIME_LIMIT, error=str(exc))
-        except StepLimitExceededError as exc:
-            return _result(ctx, RunOutcome.STEP_LIMIT, error=str(exc))
-        except CostLimitExceededError as exc:
-            logger.warning(
-                "refused a call that would breach the cost ceiling",
-                extra={"run_id": ctx.run_id, "tool": decision.tool},
-            )
-            return _result(ctx, RunOutcome.COST_LIMIT, error=str(exc))
-
-        # --- would policy permit this at all? ---------------------------
-        # Checked before the gate, deliberately. Asking a reviewer to approve
-        # a call that authorisation will refuse anyway wastes the scarcest
-        # thing in the loop, and trains reviewers that approvals are
-        # inconsequential.
-        try:
-            registry.check(decision.tool, decision.arguments, ctx.principal)
-        except (ToolDeniedError, ToolNotFoundError, RateLimitExceededError) as exc:
+        # --- one or more tool calls -------------------------------------
+        # Branched on `isinstance` rather than on a boolean flag, so the union
+        # is narrowed in both arms and a `CallTools` can never be read as if it
+        # had a single `.tool`.
+        if isinstance(decision, CallTools):
+            calls: tuple[CallTool, ...] = decision.calls
+            # The batch is the intent, so the batch is what is recorded. A PLAN
+            # step per call would say the planner took several turns, and a
+            # replay built from that record would take several turns too.
             ctx.record(
                 StepRecord(
                     index=ctx.step_count,
-                    kind=StepKind.TOOL_CALL,
-                    summary=f"{decision.tool} refused before review",
+                    kind=StepKind.PLAN,
+                    summary=decision.rationale or f"call {len(calls)} tools in parallel",
+                    cost_usd=decision.cost_usd,
+                    duration_ms=plan_ms,
+                    metadata={
+                        "parallel": True,
+                        "calls": [
+                            {
+                                "tool": c.tool,
+                                "arguments": c.arguments,
+                                "rationale": c.rationale,
+                                "estimated_cost_usd": c.estimated_cost_usd,
+                            }
+                            for c in calls
+                        ],
+                    },
+                )
+            )
+        else:
+            calls = (decision,)
+            ctx.record(
+                StepRecord(
+                    index=ctx.step_count,
+                    kind=StepKind.PLAN,
+                    summary=decision.rationale or f"call {decision.tool}",
+                    # The intent is recorded here, before the ceilings are
+                    # checked. A decision formed and then prevented is the thing
+                    # an auditor asks about, and recording it only on the
+                    # TOOL_CALL step means a run stopped by a ceiling loses its
+                    # final intention.
                     tool_name=decision.tool,
                     arguments=decision.arguments,
+                    cost_usd=decision.cost_usd,
+                    duration_ms=plan_ms,
+                )
+            )
+
+        # --- is the fan-out itself allowed? -----------------------------
+        if len(calls) > ctx.limits.max_parallel_calls:
+            # Not a failed call: a plan the run will not carry out. Recorded as
+            # a correction so the planner can split it, and counted as a failure
+            # so one that keeps asking runs out of patience rather than turns.
+            ctx.record(
+                StepRecord(
+                    index=ctx.step_count,
+                    kind=StepKind.CORRECTION,
+                    summary=f"refused a batch of {len(calls)}",
                     error=(
-                        f"denied: {exc.reason}"
-                        if isinstance(exc, ToolDeniedError)
-                        else f"{type(exc).__name__}: {exc}"
+                        f"{len(calls)} parallel calls exceeds "
+                        f"max_parallel_calls={ctx.limits.max_parallel_calls}"
                     ),
                 )
             )
@@ -225,63 +237,91 @@ async def run_agent(
                 )
             continue
 
-        # --- does a human need to see this? -----------------------------
-        # The effective tier is the higher of the run's and the tool's: a
-        # routine run calling a critical tool is a critical call.
-        effective_tier = ctx.tier
-        if decision.tool in registry:
-            effective_tier = max(ctx.tier, registry.spec(decision.tool).tier)
-
-        approval = await gate.review(
-            ApprovalRequest(
-                run_id=ctx.run_id,
-                principal=ctx.principal,
-                tool=decision.tool,
-                arguments=decision.arguments,
-                tier=effective_tier,
-                rationale=decision.rationale,
-                steps_taken=ctx.step_count,
-            )
-        )
-        if not approval.approved:
-            # Recorded before returning: an approval decision that leaves no
-            # trace is indistinguishable from no approval at all.
-            ctx.record(
-                StepRecord(
-                    index=ctx.step_count,
-                    kind=StepKind.APPROVAL,
-                    summary=f"{decision.tool} refused by {approval.approver}",
-                    tool_name=decision.tool,
-                    error=f"not approved: {approval.reason}",
-                    metadata={"approver": approval.approver, "tier": int(effective_tier)},
-                )
-            )
-            logger.warning(
-                "run stopped by an approval gate",
-                extra={
-                    "run_id": ctx.run_id,
-                    "tool": decision.tool,
-                    "approver": approval.approver,
-                },
-            )
+        # --- is there room to record all of them? -----------------------
+        # Checked for the whole batch. Running half of something planned as a
+        # unit leaves the planner reasoning about a state that never existed.
+        if ctx.step_count + len(calls) > ctx.limits.max_steps:
             return _result(
-                ctx, RunOutcome.NOT_APPROVED, error=f"{decision.tool}: {approval.reason}"
+                ctx,
+                RunOutcome.STEP_LIMIT,
+                error=f"a batch of {len(calls)} does not fit in the remaining steps",
             )
 
-        if approval.gated:
-            ctx.record(
-                StepRecord(
-                    index=ctx.step_count,
-                    kind=StepKind.APPROVAL,
-                    summary=f"{decision.tool} approved by {approval.approver}",
-                    tool_name=decision.tool,
-                    metadata={"approver": approval.approver, "tier": int(effective_tier)},
+        # --- can the whole batch be afforded? ---------------------------
+        # The sum, not each call in turn. Cost cannot be un-spent, so a batch
+        # that would breach the ceiling is refused entire rather than executed
+        # up to the line and abandoned.
+        projected = sum(c.estimated_cost_usd for c in calls)
+        try:
+            ctx.before_step(projected_cost_usd=projected)
+        except WallClockExceededError as exc:
+            return _result(ctx, RunOutcome.TIME_LIMIT, error=str(exc))
+        except StepLimitExceededError as exc:
+            return _result(ctx, RunOutcome.STEP_LIMIT, error=str(exc))
+        except CostLimitExceededError as exc:
+            logger.warning(
+                "refused a batch that would breach the cost ceiling",
+                extra={"run_id": ctx.run_id, "calls": len(calls)},
+            )
+            return _result(ctx, RunOutcome.COST_LIMIT, error=str(exc))
+
+        # --- would policy permit these at all? --------------------------
+        # Checked before the gate, deliberately. Asking a reviewer to approve a
+        # call that authorisation will refuse anyway wastes the scarcest thing
+        # in the loop, and trains reviewers that approvals are inconsequential.
+        #
+        # Per call rather than per batch, unlike cost: a denial spends nothing
+        # and tells the planner something useful, so the calls that *are*
+        # permitted still run and the planner learns both things in one turn.
+        permitted: list[CallTool] = []
+        for call in calls:
+            try:
+                registry.check(call.tool, call.arguments, ctx.principal)
+            except (ToolDeniedError, ToolNotFoundError, RateLimitExceededError) as exc:
+                ctx.record(
+                    StepRecord(
+                        index=ctx.step_count,
+                        kind=StepKind.TOOL_CALL,
+                        summary=f"{call.tool} refused before review",
+                        tool_name=call.tool,
+                        arguments=call.arguments,
+                        error=(
+                            f"denied: {exc.reason}"
+                            if isinstance(exc, ToolDeniedError)
+                            else f"{type(exc).__name__}: {exc}"
+                        ),
+                    )
                 )
-            )
+                continue
+            permitted.append(call)
 
-        outcome = await _invoke(decision, registry, ctx)
-        if outcome is not None:
-            return outcome
+        if not permitted:
+            if ctx.should_give_up():
+                return _result(
+                    ctx,
+                    RunOutcome.GAVE_UP,
+                    error=f"{ctx.consecutive_failures} consecutive failures",
+                )
+            continue
+
+        # --- does a human need to see any of these? ---------------------
+        refusal = await _review(permitted, registry, gate, ctx)
+        if refusal is not None:
+            return refusal
+
+        # --- run them ---------------------------------------------------
+        if len(permitted) > 1:
+            records = list(await asyncio.gather(*(_run_one(c, registry, ctx) for c in permitted)))
+        else:
+            records = [await _run_one(permitted[0], registry, ctx)]
+
+        # `gather` preserves the order of its arguments, not the order things
+        # finished -- which is the reason it is used here rather than
+        # `as_completed`. Completion order is a property of the network on the
+        # day, and a trace that reflected it would not replay to the same thing
+        # twice.
+        for record in records:
+            ctx.record(replace(record, index=ctx.step_count))
 
         # --- give up? ---------------------------------------------------
         if ctx.should_give_up():
@@ -296,97 +336,127 @@ async def run_agent(
             )
 
 
-async def _invoke(decision: CallTool, registry: ToolRegistry, ctx: RunContext) -> RunResult | None:
-    """Perform one tool call. Returns a RunResult only if the run must end.
+async def _review(
+    calls: list[CallTool],
+    registry: ToolRegistry,
+    gate: ApprovalGate,
+    ctx: RunContext,
+) -> RunResult | None:
+    """Put each call to the gate. Returns a result only if the run must end.
 
-    Failures are recorded and fed back to the planner rather than ending the
-    run — that feedback *is* self-correction. What stops an agent retrying
+    A refusal anywhere in a batch stops the batch. ADR-0008 makes a refusal
+    terminal for the run, and "terminal except for the other four calls the
+    planner asked for in the same breath" is not terminal.
+    """
+    for call in calls:
+        # The effective tier is the higher of the run's and the tool's: a
+        # routine run calling a critical tool is a critical call.
+        effective_tier = ctx.tier
+        if call.tool in registry:
+            effective_tier = max(ctx.tier, registry.spec(call.tool).tier)
+
+        approval = await gate.review(
+            ApprovalRequest(
+                run_id=ctx.run_id,
+                principal=ctx.principal,
+                tool=call.tool,
+                arguments=call.arguments,
+                tier=effective_tier,
+                rationale=call.rationale,
+                steps_taken=ctx.step_count,
+            )
+        )
+        if not approval.approved:
+            # Recorded before returning: an approval decision that leaves no
+            # trace is indistinguishable from no approval at all.
+            ctx.record(
+                StepRecord(
+                    index=ctx.step_count,
+                    kind=StepKind.APPROVAL,
+                    summary=f"{call.tool} refused by {approval.approver}",
+                    tool_name=call.tool,
+                    error=f"not approved: {approval.reason}",
+                    metadata={"approver": approval.approver, "tier": int(effective_tier)},
+                )
+            )
+            logger.warning(
+                "run stopped by an approval gate",
+                extra={
+                    "run_id": ctx.run_id,
+                    "tool": call.tool,
+                    "approver": approval.approver,
+                },
+            )
+            return _result(ctx, RunOutcome.NOT_APPROVED, error=f"{call.tool}: {approval.reason}")
+
+        if approval.gated:
+            ctx.record(
+                StepRecord(
+                    index=ctx.step_count,
+                    kind=StepKind.APPROVAL,
+                    summary=f"{call.tool} approved by {approval.approver}",
+                    tool_name=call.tool,
+                    metadata={"approver": approval.approver, "tier": int(effective_tier)},
+                )
+            )
+
+    return None
+
+
+async def _run_one(call: CallTool, registry: ToolRegistry, ctx: RunContext) -> StepRecord:
+    """Perform one tool call and describe what happened.
+
+    Returns a record rather than writing one. That is what lets a batch be
+    recorded in the order it was planned instead of the order it finished;
+    `index` is filled in by the caller at record time.
+
+    Failures are described and fed back to the planner rather than ending the
+    run -- that feedback *is* self-correction. What stops an agent retrying
     forever is the consecutive-failure ceiling, not this function.
     """
     spec_timeout: float | None = None
-    if decision.tool in registry:
-        spec_timeout = registry.spec(decision.tool).timeout_seconds
+    if call.tool in registry:
+        spec_timeout = registry.spec(call.tool).timeout_seconds
     budget = ctx.timeout_for(spec_timeout)
-
     started = time.perf_counter()
-    try:
-        # Already checked above; calling invoke again would double-count the rate limit.
-        result = await asyncio.wait_for(registry.call(decision.tool, decision.arguments), budget)
-    except TimeoutError:
-        # A timeout is a failed action, not a failed run. The downstream may
-        # simply be slow and the planner may have another route, so it goes
-        # back as an observation. What stops the agent waiting forever is this
-        # bound; what stops it retrying a dead downstream forever is the
-        # consecutive-failure ceiling.
-        ctx.record(
-            StepRecord(
-                index=ctx.step_count,
-                kind=StepKind.TOOL_CALL,
-                summary=f"{decision.tool} timed out",
-                tool_name=decision.tool,
-                arguments=decision.arguments,
-                error=f"timed out after {budget:.1f}s",
-                duration_ms=(time.perf_counter() - started) * 1000,
-            )
-        )
-        return None
-    except ToolDeniedError as exc:
-        # A denial is the system working, so it is recorded and returned to
-        # the planner: there may be a legitimate alternative route. But it
-        # counts toward the failure ceiling, because an agent that probes
-        # denials indefinitely is a security problem rather than a persistent
-        # one.
-        ctx.record(
-            StepRecord(
-                index=ctx.step_count,
-                kind=StepKind.TOOL_CALL,
-                summary=f"{decision.tool} denied",
-                tool_name=decision.tool,
-                arguments=decision.arguments,
-                error=f"denied: {exc.reason}",
-                duration_ms=(time.perf_counter() - started) * 1000,
-            )
-        )
-        return None
-    except (ToolNotFoundError, RateLimitExceededError) as exc:
-        ctx.record(
-            StepRecord(
-                index=ctx.step_count,
-                kind=StepKind.TOOL_CALL,
-                summary=f"{decision.tool} unavailable",
-                tool_name=decision.tool,
-                arguments=decision.arguments,
-                error=f"{type(exc).__name__}: {exc}",
-                duration_ms=(time.perf_counter() - started) * 1000,
-            )
-        )
-        return None
-    except Exception as exc:
-        # The tool itself failed. Also an observation, not a crash — a flaky
-        # downstream is exactly the situation self-correction is for.
-        ctx.record(
-            StepRecord(
-                index=ctx.step_count,
-                kind=StepKind.TOOL_CALL,
-                summary=f"{decision.tool} failed",
-                tool_name=decision.tool,
-                arguments=decision.arguments,
-                error=f"{type(exc).__name__}: {exc}",
-                duration_ms=(time.perf_counter() - started) * 1000,
-            )
-        )
-        return None
 
-    ctx.record(
-        StepRecord(
-            index=ctx.step_count,
+    def _record(
+        summary: str,
+        *,
+        error: str | None = None,
+        result: Any = None,
+        cost_usd: float = 0.0,
+    ) -> StepRecord:
+        return StepRecord(
+            index=-1,  # assigned by the caller
             kind=StepKind.TOOL_CALL,
-            summary=f"{decision.tool} ok",
-            tool_name=decision.tool,
-            arguments=decision.arguments,
+            summary=summary,
+            tool_name=call.tool,
+            arguments=call.arguments,
             result=result,
-            cost_usd=decision.estimated_cost_usd,
+            error=error,
+            cost_usd=cost_usd,
             duration_ms=(time.perf_counter() - started) * 1000,
         )
-    )
-    return None
+
+    try:
+        # Already checked above; calling invoke again would double-count the rate limit.
+        value = await asyncio.wait_for(registry.call(call.tool, call.arguments), budget)
+    except TimeoutError:
+        # A timeout is a failed action, not a failed run. The downstream may
+        # simply be slow and the planner may have another route.
+        return _record(f"{call.tool} timed out", error=f"timed out after {budget:.1f}s")
+    except ToolDeniedError as exc:
+        # A denial is the system working, so it goes back to the planner: there
+        # may be a legitimate alternative route. It still counts toward the
+        # failure ceiling, because an agent that probes denials indefinitely is
+        # a security problem rather than a persistent one.
+        return _record(f"{call.tool} denied", error=f"denied: {exc.reason}")
+    except (ToolNotFoundError, RateLimitExceededError) as exc:
+        return _record(f"{call.tool} unavailable", error=f"{type(exc).__name__}: {exc}")
+    except Exception as exc:
+        # The tool itself failed. Also an observation, not a crash -- a flaky
+        # downstream is exactly the situation self-correction is for.
+        return _record(f"{call.tool} failed", error=f"{type(exc).__name__}: {exc}")
+
+    return _record(f"{call.tool} ok", result=value, cost_usd=call.estimated_cost_usd)

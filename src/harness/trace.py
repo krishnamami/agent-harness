@@ -28,10 +28,10 @@ from __future__ import annotations
 import hashlib
 import json
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 
-from harness.planner import CallTool, Decision, Finish, PlannerState
+from harness.planner import CallTool, CallTools, Decision, Finish, PlannerState
 from harness.policy import AuditPolicy, Principal, RiskTier, StandardAudit
 from harness.run import (
     RunContext,
@@ -107,6 +107,7 @@ class RunTrace:
                 "max_wall_clock_seconds": self.limits.max_wall_clock_seconds,
                 "default_tool_timeout_seconds": self.limits.default_tool_timeout_seconds,
                 "max_delegation_depth": self.limits.max_delegation_depth,
+                "max_parallel_calls": self.limits.max_parallel_calls,
             },
             "provenance": {
                 "recorded_at": self.provenance.recorded_at,
@@ -124,6 +125,12 @@ class RunTrace:
                     "result": s.result,
                     "error": s.error,
                     "cost_usd": s.cost_usd,
+                    # Metadata carries the parallel batch and the
+                    # `arguments_withheld` marker. Dropping it on the way out
+                    # meant a reloaded trace silently lost both: a withheld
+                    # trace replayed with empty arguments instead of refusing,
+                    # and a batched plan came back as a plan with no calls.
+                    "metadata": s.metadata,
                 }
                 for s in self.steps
             ],
@@ -159,6 +166,7 @@ class RunTrace:
                 max_wall_clock_seconds=lim.get("max_wall_clock_seconds", 300.0),
                 default_tool_timeout_seconds=lim.get("default_tool_timeout_seconds", 30.0),
                 max_delegation_depth=lim.get("max_delegation_depth", 3),
+                max_parallel_calls=lim.get("max_parallel_calls", 8),
             ),
             steps=tuple(
                 StepRecord(
@@ -170,6 +178,7 @@ class RunTrace:
                     result=s["result"],
                     error=s["error"],
                     cost_usd=s["cost_usd"],
+                    metadata=s.get("metadata", {}),
                 )
                 for s in data["steps"]
             ),
@@ -193,6 +202,35 @@ class RunTrace:
             raise TraceError(f"unreadable trace: {exc}") from exc
 
 
+def _redact(step: StepRecord, audit: AuditPolicy) -> StepRecord:
+    """Strip arguments the audit policy says must not be recorded.
+
+    A batched `PLAN` step carries its calls in metadata rather than in
+    `tool_name`/`arguments`, so the single-call check does not see them. Left
+    as it was, batching would have been a way around the audit policy: the same
+    tool, the same arguments, recorded in full because they arrived in a list.
+    """
+    if step.metadata.get("parallel"):
+        calls = step.metadata.get("calls", [])
+        if all(audit.must_record_arguments(c["tool"]) for c in calls):
+            return step
+        return replace(
+            step,
+            metadata={
+                **step.metadata,
+                "calls": [
+                    c if audit.must_record_arguments(c["tool"]) else {**c, "arguments": None}
+                    for c in calls
+                ],
+                "arguments_withheld": True,
+            },
+        )
+
+    if step.tool_name is None or audit.must_record_arguments(step.tool_name):
+        return step
+    return replace(step, arguments=None, metadata={**step.metadata, "arguments_withheld": True})
+
+
 def record_trace(
     goal: str,
     ctx: RunContext,
@@ -209,22 +247,7 @@ def record_trace(
     """
     audit = audit or StandardAudit()
 
-    steps = tuple(
-        s
-        if s.tool_name is None or audit.must_record_arguments(s.tool_name)
-        else StepRecord(
-            index=s.index,
-            kind=s.kind,
-            summary=s.summary,
-            tool_name=s.tool_name,
-            arguments=None,
-            result=s.result,
-            error=s.error,
-            cost_usd=s.cost_usd,
-            metadata={**s.metadata, "arguments_withheld": True},
-        )
-        for s in result.steps
-    )
+    steps = tuple(_redact(s, audit) for s in result.steps)
 
     digests: dict[str, str] = {}
     policy_name = "unknown"
@@ -275,6 +298,22 @@ def decisions_from(trace: RunTrace) -> list[Decision]:
                     f"step {step.index}: arguments were withheld at record time, "
                     "so this trace can be inspected but not replayed"
                 )
+            if step.metadata.get("parallel"):
+                decisions.append(
+                    CallTools(
+                        calls=tuple(
+                            CallTool(
+                                tool=c["tool"],
+                                arguments=c["arguments"] or {},
+                                rationale=c.get("rationale", ""),
+                                estimated_cost_usd=c.get("estimated_cost_usd", 0.0),
+                            )
+                            for c in step.metadata.get("calls", [])
+                        ),
+                        rationale=step.summary,
+                    )
+                )
+                continue
             decisions.append(
                 CallTool(
                     tool=step.tool_name or "",
