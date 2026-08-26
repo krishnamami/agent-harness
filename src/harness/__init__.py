@@ -15,6 +15,14 @@ docs/adr/0001.
 """
 
 from harness.executor import run_agent
+from harness.memory import (
+    InMemoryStore,
+    Memory,
+    MemoryRecord,
+    MemoryStore,
+    MemoryTier,
+    WorkingMemory,
+)
 from harness.planner import (
     CallTool,
     Decision,
@@ -61,7 +69,12 @@ __all__ = [
     "CostLimitExceededError",
     "Decision",
     "Finish",
+    "InMemoryStore",
     "LimitExceededError",
+    "Memory",
+    "MemoryRecord",
+    "MemoryStore",
+    "MemoryTier",
     "OpenAuthorization",
     "Planner",
     "PlannerState",
@@ -83,5 +96,6 @@ __all__ = [
     "ToolNotFoundError",
     "ToolRegistry",
     "ToolSpec",
+    "WorkingMemory",
     "run_agent",
 ]
