@@ -117,6 +117,7 @@ it is the difference between a decision and a habit.
 | [0011](docs/adr/0011-delegation-narrows.md) | Delegation narrows; it never widens |
 | [0012](docs/adr/0012-a-refusal-is-terminal-for-the-sub-run.md) | A refusal is terminal for the sub-run, not for the tree |
 | [0013](docs/adr/0013-a-batch-of-calls-is-one-intent.md) | A batch of calls is one intent |
+| [0014](docs/adr/0014-the-harness-emits-spans-the-service-exports-them.md) | The harness emits spans; the service exports them |
 
 ---
 
@@ -204,6 +205,37 @@ months later.
 so *"nobody looked because it was below the threshold"* and *"somebody looked and
 said yes"* are distinguishable in the record. They are very different sentences
 in an audit.
+
+---
+
+## What an operator sees
+
+The harness emits spans. It does not decide where they go: it imports the
+OpenTelemetry **API**, which is a no-op until a service installs a provider, so
+the service owns the exporter and the sampling. A library that configured its
+own exporter would be making a deployment decision for everyone who imports it.
+
+Five span kinds — `agent.run`, `agent.plan`, `agent.tool`, `agent.approval`,
+`agent.delegate` — arranged so that **the span tree is the agent tree**. A
+delegation wraps the child's run, so a coordinator with four workers looks like
+a coordinator with four workers. Parallel calls become sibling tool spans: an
+overlapping timeline is what concurrency looks like in a backend, and a
+serialised one is what a regression looks like.
+
+Two decisions in there matter more than the plumbing.
+
+**Arguments and results never go on a span.** `AuditPolicy` governs what the
+*trace* retains, and a regulated deployment uses it to withhold the arguments of
+sensitive tools. A span goes somewhere else — an observability backend, with its
+own retention, its own access control and a much wider audience. Putting
+arguments on spans would route around the audit policy through a side door.
+Spans carry names, tiers, counts, durations, outcomes, cost, and identities.
+Never payloads.
+
+**A bounded stop is not an error.** Every ceiling leaves the span status `OK`
+with `harness.outcome` set; only a crash sets `ERROR`. Marking ceilings as
+errors would make the error rate on every dashboard a measure of how often the
+bounds did their job.
 
 ---
 
@@ -339,8 +371,8 @@ A repository is defined as much by its refusals as by its contents.
 
 | Check | Result |
 |-------|--------|
-| Tests | **244 passing** |
-| Coverage | **97.11%**, enforced as a CI gate, floor lives in `pyproject.toml` |
+| Tests | **259 passing** |
+| Coverage | **97.14%**, enforced as a CI gate, floor lives in `pyproject.toml` |
 | Type checking | `mypy --strict` clean across **28 source modules** |
 | Lint / format | `ruff check` + `ruff format --check` clean |
 | Supply chain | `pip-audit --strict` against the exported lockfile — no known vulnerabilities |
@@ -408,8 +440,8 @@ than by testing the batch on its own. → ADR-0013
 ```bash
 uv sync --extra dev
 
-uv run pytest                          # 244 tests, coverage gate
-uv run mypy                            # strict, 29 modules
+uv run pytest                          # 259 tests, coverage gate
+uv run mypy                            # strict, 30 modules
 uv run ruff check src tests
 ```
 

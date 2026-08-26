@@ -61,6 +61,7 @@ from harness.run import (
     StepKind,
     StepRecord,
 )
+from harness.spans import DELEGATE, record_error, tracer
 from harness.tools import ToolRegistry
 
 logger = logging.getLogger(__name__)
@@ -203,24 +204,40 @@ async def delegate(
     does not get is more authority, more money or more time than the parent had
     to give.
     """
-    child = new_child_context(
-        parent, principal=principal, limits=limits, tier=tier, metadata=metadata
-    )
-    if isinstance(child, RunOutcome):
-        return _refused(parent, sub_goal, child, f"parent cannot start a child run ({child})")
+    # The span opens before the checks, so a delegation that was *refused* is
+    # visible in a backend too. A tree showing only the delegations that
+    # happened cannot answer why a branch is missing.
+    with tracer.start_as_current_span(DELEGATE) as span:
+        span.set_attribute("harness.parent_run_id", parent.run_id)
+        span.set_attribute("harness.depth", parent.depth + 1)
 
-    logger.info(
-        "delegating",
-        extra={
-            "run_id": parent.run_id,
-            "child_run_id": child.run_id,
-            "depth": child.depth,
-            "principal": child.principal.id,
-            "budget_usd": round(child.limits.max_cost_usd, 4),
-        },
-    )
+        child = new_child_context(
+            parent, principal=principal, limits=limits, tier=tier, metadata=metadata
+        )
+        if isinstance(child, RunOutcome):
+            record_error(span, "refused", str(child))
+            return _refused(parent, sub_goal, child, f"parent cannot start a child run ({child})")
 
-    result = await run_agent(sub_goal, planner, registry, child, gate)
+        span.set_attribute("harness.child.run_id", child.run_id)
+        span.set_attribute("harness.child.principal", child.principal.id)
+        span.set_attribute("harness.child.budget_usd", round(child.limits.max_cost_usd, 6))
+
+        logger.info(
+            "delegating",
+            extra={
+                "run_id": parent.run_id,
+                "child_run_id": child.run_id,
+                "depth": child.depth,
+                "principal": child.principal.id,
+                "budget_usd": round(child.limits.max_cost_usd, 4),
+            },
+        )
+
+        # The child's own run span nests inside this one, so the agent tree and
+        # the span tree are the same shape.
+        result = await run_agent(sub_goal, planner, registry, child, gate)
+        span.set_attribute("harness.child.outcome", str(result.outcome))
+
     parent.sub_runs.append(result)
 
     # One step, carrying the child's whole cost. Recording it through the

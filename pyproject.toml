@@ -8,6 +8,11 @@ dependencies = [
     "uvicorn[standard]>=0.32",
     "pydantic>=2.9",
     "pydantic-settings>=2.6",
+    # The harness imports the *API* only: `get_tracer` is a no-op until a
+    # service installs a provider. Declared explicitly rather than leaned on
+    # transitively through the SDK, because that is the dependency the library
+    # actually has.
+    "opentelemetry-api>=1.29",
     "opentelemetry-sdk>=1.29",
     "opentelemetry-exporter-otlp-proto-http>=1.29",
     "opentelemetry-instrumentation-fastapi>=0.50b0",

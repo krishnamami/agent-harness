@@ -15,8 +15,10 @@ import time
 from dataclasses import replace
 from typing import Any
 
+from opentelemetry.trace import Span
+
 from harness.gates import ApprovalGate, ApprovalRequest, AutoApprove
-from harness.planner import CallTool, CallTools, Finish, Planner, PlannerState
+from harness.planner import CallTool, CallTools, Decision, Finish, Planner, PlannerState
 from harness.run import (
     CostLimitExceededError,
     RunContext,
@@ -26,6 +28,16 @@ from harness.run import (
     StepLimitExceededError,
     StepRecord,
     WallClockExceededError,
+)
+from harness.spans import (
+    APPROVAL,
+    PLAN,
+    RUN,
+    TOOL,
+    describe_run,
+    record_error,
+    record_outcome,
+    tracer,
 )
 from harness.tools import (
     RateLimitExceededError,
@@ -68,17 +80,34 @@ async def run_agent(
     the ceilings instead of guessing at them.
     """
     gate = gate if gate is not None else AutoApprove()
-    logger.info(
-        "run started",
-        extra={
-            "run_id": ctx.run_id,
-            "goal": goal,
-            "tier": int(ctx.tier),
-            "planner": planner.name,
-            "gate": gate.name,
-        },
-    )
 
+    # The span wraps the whole run, so a delegated child's span nests inside
+    # its parent's and the tree an operator sees matches the tree that ran.
+    with tracer.start_as_current_span(RUN) as span:
+        describe_run(span, ctx)
+        logger.info(
+            "run started",
+            extra={
+                "run_id": ctx.run_id,
+                "goal": goal,
+                "tier": int(ctx.tier),
+                "planner": planner.name,
+                "gate": gate.name,
+            },
+        )
+        result = await _loop(goal, planner, registry, ctx, gate)
+        record_outcome(span, result)
+        return result
+
+
+async def _loop(
+    goal: str,
+    planner: Planner,
+    registry: ToolRegistry,
+    ctx: RunContext,
+    gate: ApprovalGate,
+) -> RunResult:
+    """The loop itself. Separated so the run span wraps every exit from it."""
     while True:
         # --- can we afford another step at all? -------------------------
         try:
@@ -106,40 +135,11 @@ async def run_agent(
         )
 
         started = time.perf_counter()
-        try:
-            decision = await asyncio.wait_for(planner.decide(state), ctx.remaining_seconds)
-        except TimeoutError:
-            # The likeliest hang in the loop: a planner is usually a model call
-            # over a network. Bounded by what the run has left rather than by a
-            # timeout of its own, so a slow planner cannot carry the run past
-            # its ceiling one plan at a time.
-            logger.warning("planner timed out", extra={"run_id": ctx.run_id})
-            ctx.record(
-                StepRecord(
-                    index=ctx.step_count,
-                    kind=StepKind.PLAN,
-                    summary="planner timed out",
-                    error=f"planner exceeded the run's {ctx.limits.max_wall_clock_seconds:.0f}s",
-                    duration_ms=(time.perf_counter() - started) * 1000,
-                )
-            )
-            return _result(ctx, RunOutcome.TIME_LIMIT, error="planner timed out")
-        except Exception as exc:
-            # A planner that raises ends the run. There is no sensible way to
-            # continue without knowing what to do next, and retrying a planner
-            # that just crashed is how you spend a budget on stack traces.
-            logger.exception("planner failed", extra={"run_id": ctx.run_id})
-            ctx.record(
-                StepRecord(
-                    index=ctx.step_count,
-                    kind=StepKind.PLAN,
-                    summary="planner raised",
-                    error=f"{type(exc).__name__}: {exc}",
-                    duration_ms=(time.perf_counter() - started) * 1000,
-                )
-            )
-            return _result(ctx, RunOutcome.FAILED, error=f"planner: {type(exc).__name__}: {exc}")
-
+        with tracer.start_as_current_span(PLAN) as plan_span:
+            plan_span.set_attribute("harness.planner", planner.name)
+            decision = await _decide(planner, state, ctx, plan_span, started)
+        if isinstance(decision, RunResult):
+            return decision
         plan_ms = (time.perf_counter() - started) * 1000
 
         # --- finish -----------------------------------------------------
@@ -336,6 +336,66 @@ async def run_agent(
             )
 
 
+async def _decide(
+    planner: Planner,
+    state: PlannerState,
+    ctx: RunContext,
+    span: Span,
+    started: float,
+) -> Decision | RunResult:
+    """Ask the planner what to do next.
+
+    Returns the decision, or a `RunResult` if the planner ended the run by
+    hanging or raising. Extracted from the loop so the plan span closes on
+    every path out of it, including the two that end the run.
+    """
+    try:
+        decision = await asyncio.wait_for(planner.decide(state), ctx.remaining_seconds)
+    except TimeoutError:
+        # The likeliest hang in the loop: a planner is usually a model call
+        # over a network. Bounded by what the run has left rather than by a
+        # timeout of its own, so a slow planner cannot carry the run past its
+        # ceiling one plan at a time.
+        record_error(span, "timeout", "planner timed out")
+        logger.warning("planner timed out", extra={"run_id": ctx.run_id})
+        ctx.record(
+            StepRecord(
+                index=ctx.step_count,
+                kind=StepKind.PLAN,
+                summary="planner timed out",
+                error=f"planner exceeded the run's {ctx.limits.max_wall_clock_seconds:.0f}s",
+                duration_ms=(time.perf_counter() - started) * 1000,
+            )
+        )
+        return _result(ctx, RunOutcome.TIME_LIMIT, error="planner timed out")
+    except Exception as exc:
+        # A planner that raises ends the run. There is no sensible way to
+        # continue without knowing what to do next, and retrying a planner that
+        # just crashed is how you spend a budget on stack traces.
+        record_error(span, "failed", f"{type(exc).__name__}: {exc}")
+        logger.exception("planner failed", extra={"run_id": ctx.run_id})
+        ctx.record(
+            StepRecord(
+                index=ctx.step_count,
+                kind=StepKind.PLAN,
+                summary="planner raised",
+                error=f"{type(exc).__name__}: {exc}",
+                duration_ms=(time.perf_counter() - started) * 1000,
+            )
+        )
+        return _result(ctx, RunOutcome.FAILED, error=f"planner: {type(exc).__name__}: {exc}")
+
+    if isinstance(decision, CallTools):
+        span.set_attribute("harness.decision", "call_tools")
+        span.set_attribute("harness.calls", len(decision.calls))
+    elif isinstance(decision, CallTool):
+        span.set_attribute("harness.decision", "call_tool")
+        span.set_attribute("harness.calls", 1)
+    else:
+        span.set_attribute("harness.decision", "finish")
+    return decision
+
+
 async def _review(
     calls: list[CallTool],
     registry: ToolRegistry,
@@ -355,17 +415,28 @@ async def _review(
         if call.tool in registry:
             effective_tier = max(ctx.tier, registry.spec(call.tool).tier)
 
-        approval = await gate.review(
-            ApprovalRequest(
-                run_id=ctx.run_id,
-                principal=ctx.principal,
-                tool=call.tool,
-                arguments=call.arguments,
-                tier=effective_tier,
-                rationale=call.rationale,
-                steps_taken=ctx.step_count,
+        with tracer.start_as_current_span(APPROVAL) as span:
+            span.set_attribute("gen_ai.tool.name", call.tool)
+            span.set_attribute("harness.tier", str(effective_tier))
+            approval = await gate.review(
+                ApprovalRequest(
+                    run_id=ctx.run_id,
+                    principal=ctx.principal,
+                    tool=call.tool,
+                    arguments=call.arguments,
+                    tier=effective_tier,
+                    rationale=call.rationale,
+                    steps_taken=ctx.step_count,
+                )
             )
-        )
+            # `gated` and `approved` are separate facts: "nobody looked because
+            # it was below the threshold" and "somebody looked and said yes"
+            # are very different sentences in an audit.
+            span.set_attribute("harness.gated", approval.gated)
+            span.set_attribute("harness.approved", approval.approved)
+            span.set_attribute("harness.approver", approval.approver)
+            if not approval.approved:
+                record_error(span, "not_approved", approval.reason or "refused")
         if not approval.approved:
             # Recorded before returning: an approval decision that leaves no
             # trace is indistinguishable from no approval at all.
@@ -415,48 +486,64 @@ async def _run_one(call: CallTool, registry: ToolRegistry, ctx: RunContext) -> S
     forever is the consecutive-failure ceiling, not this function.
     """
     spec_timeout: float | None = None
+    tier = None
     if call.tool in registry:
-        spec_timeout = registry.spec(call.tool).timeout_seconds
+        spec = registry.spec(call.tool)
+        spec_timeout = spec.timeout_seconds
+        tier = spec.tier
     budget = ctx.timeout_for(spec_timeout)
     started = time.perf_counter()
 
-    def _record(
-        summary: str,
-        *,
-        error: str | None = None,
-        result: Any = None,
-        cost_usd: float = 0.0,
-    ) -> StepRecord:
-        return StepRecord(
-            index=-1,  # assigned by the caller
-            kind=StepKind.TOOL_CALL,
-            summary=summary,
-            tool_name=call.tool,
-            arguments=call.arguments,
-            result=result,
-            error=error,
-            cost_usd=cost_usd,
-            duration_ms=(time.perf_counter() - started) * 1000,
-        )
+    # One span per call. In a batch these are siblings under the same plan
+    # span, so an overlapping timeline is what parallelism looks like in a
+    # backend -- and a serialised one is what a regression looks like.
+    with tracer.start_as_current_span(TOOL) as span:
+        span.set_attribute("gen_ai.tool.name", call.tool)
+        span.set_attribute("harness.timeout_s", budget)
+        if tier is not None:
+            span.set_attribute("harness.tool.tier", str(tier))
 
-    try:
-        # Already checked above; calling invoke again would double-count the rate limit.
-        value = await asyncio.wait_for(registry.call(call.tool, call.arguments), budget)
-    except TimeoutError:
-        # A timeout is a failed action, not a failed run. The downstream may
-        # simply be slow and the planner may have another route.
-        return _record(f"{call.tool} timed out", error=f"timed out after {budget:.1f}s")
-    except ToolDeniedError as exc:
-        # A denial is the system working, so it goes back to the planner: there
-        # may be a legitimate alternative route. It still counts toward the
-        # failure ceiling, because an agent that probes denials indefinitely is
-        # a security problem rather than a persistent one.
-        return _record(f"{call.tool} denied", error=f"denied: {exc.reason}")
-    except (ToolNotFoundError, RateLimitExceededError) as exc:
-        return _record(f"{call.tool} unavailable", error=f"{type(exc).__name__}: {exc}")
-    except Exception as exc:
-        # The tool itself failed. Also an observation, not a crash -- a flaky
-        # downstream is exactly the situation self-correction is for.
-        return _record(f"{call.tool} failed", error=f"{type(exc).__name__}: {exc}")
+        def _record(
+            summary: str,
+            *,
+            error: str | None = None,
+            result: Any = None,
+            cost_usd: float = 0.0,
+        ) -> StepRecord:
+            return StepRecord(
+                index=-1,  # assigned by the caller
+                kind=StepKind.TOOL_CALL,
+                summary=summary,
+                tool_name=call.tool,
+                arguments=call.arguments,
+                result=result,
+                error=error,
+                cost_usd=cost_usd,
+                duration_ms=(time.perf_counter() - started) * 1000,
+            )
 
-    return _record(f"{call.tool} ok", result=value, cost_usd=call.estimated_cost_usd)
+        try:
+            # Already checked above; calling invoke again would double-count the rate limit.
+            value = await asyncio.wait_for(registry.call(call.tool, call.arguments), budget)
+        except TimeoutError:
+            # A timeout is a failed action, not a failed run. The downstream may
+            # simply be slow and the planner may have another route.
+            record_error(span, "timeout", f"timed out after {budget:.1f}s")
+            return _record(f"{call.tool} timed out", error=f"timed out after {budget:.1f}s")
+        except ToolDeniedError as exc:
+            # A denial is the system working, so it goes back to the planner:
+            # there may be a legitimate alternative route. It still counts
+            # toward the failure ceiling, because an agent that probes denials
+            # indefinitely is a security problem rather than a persistent one.
+            record_error(span, "denied", exc.reason)
+            return _record(f"{call.tool} denied", error=f"denied: {exc.reason}")
+        except (ToolNotFoundError, RateLimitExceededError) as exc:
+            record_error(span, "unavailable", f"{type(exc).__name__}: {exc}")
+            return _record(f"{call.tool} unavailable", error=f"{type(exc).__name__}: {exc}")
+        except Exception as exc:
+            # The tool itself failed. Also an observation, not a crash -- a
+            # flaky downstream is exactly what self-correction is for.
+            record_error(span, "failed", f"{type(exc).__name__}: {exc}")
+            return _record(f"{call.tool} failed", error=f"{type(exc).__name__}: {exc}")
+
+        return _record(f"{call.tool} ok", result=value, cost_usd=call.estimated_cost_usd)
