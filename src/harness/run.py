@@ -60,6 +60,7 @@ class RunLimits:
 
 class StepKind(StrEnum):
     PLAN = "plan"
+    APPROVAL = "approval"
     TOOL_CALL = "tool_call"
     OBSERVATION = "observation"
     CORRECTION = "correction"
@@ -142,7 +143,7 @@ class RunContext:
         # give-up ceiling would never be reached. A runaway agent would burn
         # its entire step budget instead of stopping after three failures.
         # We shipped that and the test below caught it.
-        if step.kind is StepKind.PLAN:
+        if step.kind in (StepKind.PLAN, StepKind.APPROVAL):
             return
 
         if step.failed:
@@ -166,6 +167,10 @@ class RunOutcome(StrEnum):
     COST_LIMIT = "cost_limit"
     GAVE_UP = "gave_up"
     DENIED = "denied"
+    # A human said no. Distinct from DENIED, which is policy refusing a call
+    # the agent may route around; a refusal is terminal, because an agent that
+    # rephrases until someone approves is worse than no gate at all.
+    NOT_APPROVED = "not_approved"
     FAILED = "failed"
 
 

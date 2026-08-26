@@ -169,9 +169,21 @@ class ToolRegistry:
         self._check_rate_limit(entry)
         return entry.spec
 
-    async def invoke(self, name: str, arguments: dict[str, Any], principal: Principal) -> Any:
-        self.check(name, arguments, principal)
+    async def call(self, name: str, arguments: dict[str, Any]) -> Any:
+        """Run a tool that has already passed `check`.
+
+        Deliberately takes no principal: it performs no policy of its own, and
+        a signature that suggested otherwise would invite someone to call it
+        directly. The only legitimate caller is one that has just checked.
+        """
+        if name not in self._tools:
+            raise ToolNotFoundError(name)
         return await self._tools[name].fn(arguments)
+
+    async def invoke(self, name: str, arguments: dict[str, Any], principal: Principal) -> Any:
+        """Check and call. Convenience for callers with nothing to do between."""
+        self.check(name, arguments, principal)
+        return await self.call(name, arguments)
 
     def _check_rate_limit(self, entry: _Registered) -> None:
         limit = entry.spec.rate_limit_per_minute

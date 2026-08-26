@@ -310,11 +310,11 @@ class ReplayRegistry(ToolRegistry):
         self._recorded = [s for s in trace.steps if s.kind is StepKind.TOOL_CALL]
         self._cursor = 0
 
-    async def invoke(self, name: str, arguments: dict[str, Any], principal: Principal) -> Any:
-        # Policy still runs; only the side effect is replaced. `check` is what
-        # makes that possible — calling `super().invoke` would also execute the
-        # tool, which during a replay must never happen.
-        self.check(name, arguments, principal)
+    async def call(self, name: str, arguments: dict[str, Any]) -> Any:
+        # Only the side effect is replaced. `check` is inherited untouched and
+        # still runs from the executor, so replaying against today's registry
+        # answers "would this run still be permitted" — which is usually the
+        # question behind the request.
         if self._cursor >= len(self._recorded):
             raise TraceError(f"no recorded result for call {self._cursor} to {name!r}")
         step = self._recorded[self._cursor]

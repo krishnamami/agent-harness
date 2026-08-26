@@ -47,6 +47,8 @@ select = ["E", "F", "I", "N", "UP", "B", "A", "C4", "SIM", "ARG", "PTH", "RUF"]
 "src/harness/policy.py" = ["ARG002"]
 "src/harness/planner.py" = ["ARG002"]
 "src/harness/trace.py" = ["ARG002"]
+"src/harness/gates.py" = ["ARG002"]
+"src/harness/overlays.py" = ["ARG002"]
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]

@@ -13,6 +13,7 @@ import logging
 import time
 from typing import Any
 
+from harness.gates import ApprovalGate, ApprovalRequest, AutoApprove
 from harness.planner import CallTool, Finish, Planner, PlannerState
 from harness.run import (
     CostLimitExceededError,
@@ -54,6 +55,7 @@ async def run_agent(
     planner: Planner,
     registry: ToolRegistry,
     ctx: RunContext,
+    gate: ApprovalGate | None = None,
 ) -> RunResult:
     """Run until the agent finishes or a bound stops it.
 
@@ -62,9 +64,16 @@ async def run_agent(
     counting them separately from `FAILED` is what lets you tune the ceilings
     instead of guessing at them.
     """
+    gate = gate if gate is not None else AutoApprove()
     logger.info(
         "run started",
-        extra={"run_id": ctx.run_id, "goal": goal, "tier": int(ctx.tier), "planner": planner.name},
+        extra={
+            "run_id": ctx.run_id,
+            "goal": goal,
+            "tier": int(ctx.tier),
+            "planner": planner.name,
+            "gate": gate.name,
+        },
     )
 
     while True:
@@ -163,6 +172,90 @@ async def run_agent(
             )
             return _result(ctx, RunOutcome.COST_LIMIT, error=str(exc))
 
+        # --- would policy permit this at all? ---------------------------
+        # Checked before the gate, deliberately. Asking a reviewer to approve
+        # a call that authorisation will refuse anyway wastes the scarcest
+        # thing in the loop, and trains reviewers that approvals are
+        # inconsequential.
+        try:
+            registry.check(decision.tool, decision.arguments, ctx.principal)
+        except (ToolDeniedError, ToolNotFoundError, RateLimitExceededError) as exc:
+            ctx.record(
+                StepRecord(
+                    index=ctx.step_count,
+                    kind=StepKind.TOOL_CALL,
+                    summary=f"{decision.tool} refused before review",
+                    tool_name=decision.tool,
+                    arguments=decision.arguments,
+                    error=(
+                        f"denied: {exc.reason}"
+                        if isinstance(exc, ToolDeniedError)
+                        else f"{type(exc).__name__}: {exc}"
+                    ),
+                )
+            )
+            if ctx.should_give_up():
+                return _result(
+                    ctx,
+                    RunOutcome.GAVE_UP,
+                    error=f"{ctx.consecutive_failures} consecutive failures",
+                )
+            continue
+
+        # --- does a human need to see this? -----------------------------
+        # The effective tier is the higher of the run's and the tool's: a
+        # routine run calling a critical tool is a critical call.
+        effective_tier = ctx.tier
+        if decision.tool in registry:
+            effective_tier = max(ctx.tier, registry.spec(decision.tool).tier)
+
+        approval = await gate.review(
+            ApprovalRequest(
+                run_id=ctx.run_id,
+                principal=ctx.principal,
+                tool=decision.tool,
+                arguments=decision.arguments,
+                tier=effective_tier,
+                rationale=decision.rationale,
+                steps_taken=ctx.step_count,
+            )
+        )
+        if not approval.approved:
+            # Recorded before returning: an approval decision that leaves no
+            # trace is indistinguishable from no approval at all.
+            ctx.record(
+                StepRecord(
+                    index=ctx.step_count,
+                    kind=StepKind.APPROVAL,
+                    summary=f"{decision.tool} refused by {approval.approver}",
+                    tool_name=decision.tool,
+                    error=f"not approved: {approval.reason}",
+                    metadata={"approver": approval.approver, "tier": int(effective_tier)},
+                )
+            )
+            logger.warning(
+                "run stopped by an approval gate",
+                extra={
+                    "run_id": ctx.run_id,
+                    "tool": decision.tool,
+                    "approver": approval.approver,
+                },
+            )
+            return _result(
+                ctx, RunOutcome.NOT_APPROVED, error=f"{decision.tool}: {approval.reason}"
+            )
+
+        if approval.gated:
+            ctx.record(
+                StepRecord(
+                    index=ctx.step_count,
+                    kind=StepKind.APPROVAL,
+                    summary=f"{decision.tool} approved by {approval.approver}",
+                    tool_name=decision.tool,
+                    metadata={"approver": approval.approver, "tier": int(effective_tier)},
+                )
+            )
+
         outcome = await _invoke(decision, registry, ctx)
         if outcome is not None:
             return outcome
@@ -189,7 +282,8 @@ async def _invoke(decision: CallTool, registry: ToolRegistry, ctx: RunContext) -
     """
     started = time.perf_counter()
     try:
-        result = await registry.invoke(decision.tool, decision.arguments, ctx.principal)
+        # Already checked above; calling invoke again would double-count the rate limit.
+        result = await registry.call(decision.tool, decision.arguments)
     except ToolDeniedError as exc:
         # A denial is the system working, so it is recorded and returned to
         # the planner: there may be a legitimate alternative route. But it

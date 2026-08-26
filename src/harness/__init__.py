@@ -15,6 +15,15 @@ docs/adr/0001.
 """
 
 from harness.executor import run_agent
+from harness.gates import (
+    ApprovalDecision,
+    ApprovalGate,
+    ApprovalRequest,
+    AutoApprove,
+    RecordingGate,
+    RefuseAll,
+    TierGate,
+)
 from harness.memory import (
     InMemoryStore,
     Memory,
@@ -22,6 +31,12 @@ from harness.memory import (
     MemoryStore,
     MemoryTier,
     WorkingMemory,
+)
+from harness.overlays import (
+    FourEyesGate,
+    PurposeAuthorization,
+    RegulatedAudit,
+    regulated_overlay,
 )
 from harness.planner import (
     CallTool,
@@ -71,14 +86,19 @@ from harness.trace import (
 )
 
 __all__ = [
+    "ApprovalDecision",
+    "ApprovalGate",
+    "ApprovalRequest",
     "AuditPolicy",
     "AuthorizationDecision",
     "AuthorizationPolicy",
+    "AutoApprove",
     "CallTool",
     "CostLimitExceededError",
     "Decision",
     "Divergence",
     "Finish",
+    "FourEyesGate",
     "InMemoryStore",
     "LimitExceededError",
     "Memory",
@@ -90,7 +110,11 @@ __all__ = [
     "PlannerState",
     "Principal",
     "Provenance",
+    "PurposeAuthorization",
     "RateLimitExceededError",
+    "RecordingGate",
+    "RefuseAll",
+    "RegulatedAudit",
     "ReplayReport",
     "RiskTier",
     "RoleBasedAuthorization",
@@ -104,6 +128,7 @@ __all__ = [
     "StepKind",
     "StepLimitExceededError",
     "StepRecord",
+    "TierGate",
     "Tool",
     "ToolDeniedError",
     "ToolNotFoundError",
@@ -112,6 +137,7 @@ __all__ = [
     "TraceError",
     "WorkingMemory",
     "record_trace",
+    "regulated_overlay",
     "replay",
     "run_agent",
 ]
