@@ -32,6 +32,10 @@ class ToolSpec:
     parameters: dict[str, Any]
     tier: RiskTier = RiskTier.ROUTINE
     rate_limit_per_minute: int | None = None
+    # Per-tool, because one global timeout is always wrong for something:
+    # a row lookup that takes 30s is broken, and a document extraction that
+    # takes 30s is normal. None means the run's default applies.
+    timeout_seconds: float | None = None
     idempotent: bool = False
     tags: tuple[str, ...] = ()
 
@@ -42,6 +46,8 @@ class ToolSpec:
             # Tool-calling APIs universally expect an object schema at the top
             # level. Catching it here beats discovering it at inference time.
             raise ValueError(f"{self.name}: parameters must be a JSON Schema object")
+        if self.timeout_seconds is not None and self.timeout_seconds <= 0:
+            raise ValueError(f"{self.name}: timeout_seconds must be positive")
 
 
 @runtime_checkable

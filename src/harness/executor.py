@@ -9,6 +9,7 @@ whole architecture.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from typing import Any
@@ -23,6 +24,7 @@ from harness.run import (
     StepKind,
     StepLimitExceededError,
     StepRecord,
+    WallClockExceededError,
 )
 from harness.tools import (
     RateLimitExceededError,
@@ -60,9 +62,9 @@ async def run_agent(
     """Run until the agent finishes or a bound stops it.
 
     Every exit is a named outcome. A run that hits a ceiling is not a failed
-    run — `STEP_LIMIT`, `COST_LIMIT` and `GAVE_UP` are the system working, and
-    counting them separately from `FAILED` is what lets you tune the ceilings
-    instead of guessing at them.
+    run — `STEP_LIMIT`, `COST_LIMIT`, `TIME_LIMIT` and `GAVE_UP` are the system
+    working, and counting them separately from `FAILED` is what lets you tune
+    the ceilings instead of guessing at them.
     """
     gate = gate if gate is not None else AutoApprove()
     logger.info(
@@ -80,6 +82,9 @@ async def run_agent(
         # --- can we afford another step at all? -------------------------
         try:
             ctx.before_step()
+        except WallClockExceededError as exc:
+            logger.warning("run hit the wall clock", extra={"run_id": ctx.run_id})
+            return _result(ctx, RunOutcome.TIME_LIMIT, error=str(exc))
         except StepLimitExceededError as exc:
             logger.warning("run hit the step ceiling", extra={"run_id": ctx.run_id})
             return _result(ctx, RunOutcome.STEP_LIMIT, error=str(exc))
@@ -101,7 +106,23 @@ async def run_agent(
 
         started = time.perf_counter()
         try:
-            decision = await planner.decide(state)
+            decision = await asyncio.wait_for(planner.decide(state), ctx.remaining_seconds)
+        except TimeoutError:
+            # The likeliest hang in the loop: a planner is usually a model call
+            # over a network. Bounded by what the run has left rather than by a
+            # timeout of its own, so a slow planner cannot carry the run past
+            # its ceiling one plan at a time.
+            logger.warning("planner timed out", extra={"run_id": ctx.run_id})
+            ctx.record(
+                StepRecord(
+                    index=ctx.step_count,
+                    kind=StepKind.PLAN,
+                    summary="planner timed out",
+                    error=f"planner exceeded the run's {ctx.limits.max_wall_clock_seconds:.0f}s",
+                    duration_ms=(time.perf_counter() - started) * 1000,
+                )
+            )
+            return _result(ctx, RunOutcome.TIME_LIMIT, error="planner timed out")
         except Exception as exc:
             # A planner that raises ends the run. There is no sensible way to
             # continue without knowing what to do next, and retrying a planner
@@ -163,6 +184,8 @@ async def run_agent(
         # discovers it is over budget has already spent it.
         try:
             ctx.before_step(projected_cost_usd=decision.estimated_cost_usd)
+        except WallClockExceededError as exc:
+            return _result(ctx, RunOutcome.TIME_LIMIT, error=str(exc))
         except StepLimitExceededError as exc:
             return _result(ctx, RunOutcome.STEP_LIMIT, error=str(exc))
         except CostLimitExceededError as exc:
@@ -280,10 +303,33 @@ async def _invoke(decision: CallTool, registry: ToolRegistry, ctx: RunContext) -
     run — that feedback *is* self-correction. What stops an agent retrying
     forever is the consecutive-failure ceiling, not this function.
     """
+    spec_timeout: float | None = None
+    if decision.tool in registry:
+        spec_timeout = registry.spec(decision.tool).timeout_seconds
+    budget = ctx.timeout_for(spec_timeout)
+
     started = time.perf_counter()
     try:
         # Already checked above; calling invoke again would double-count the rate limit.
-        result = await registry.call(decision.tool, decision.arguments)
+        result = await asyncio.wait_for(registry.call(decision.tool, decision.arguments), budget)
+    except TimeoutError:
+        # A timeout is a failed action, not a failed run. The downstream may
+        # simply be slow and the planner may have another route, so it goes
+        # back as an observation. What stops the agent waiting forever is this
+        # bound; what stops it retrying a dead downstream forever is the
+        # consecutive-failure ceiling.
+        ctx.record(
+            StepRecord(
+                index=ctx.step_count,
+                kind=StepKind.TOOL_CALL,
+                summary=f"{decision.tool} timed out",
+                tool_name=decision.tool,
+                arguments=decision.arguments,
+                error=f"timed out after {budget:.1f}s",
+                duration_ms=(time.perf_counter() - started) * 1000,
+            )
+        )
+        return None
     except ToolDeniedError as exc:
         # A denial is the system working, so it is recorded and returned to
         # the planner: there may be a legitimate alternative route. But it

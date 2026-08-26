@@ -66,6 +66,7 @@ from harness.run import (
     StepKind,
     StepLimitExceededError,
     StepRecord,
+    WallClockExceededError,
 )
 from harness.tools import (
     RateLimitExceededError,
@@ -135,6 +136,7 @@ __all__ = [
     "ToolRegistry",
     "ToolSpec",
     "TraceError",
+    "WallClockExceededError",
     "WorkingMemory",
     "record_trace",
     "regulated_overlay",

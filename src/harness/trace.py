@@ -104,6 +104,8 @@ class RunTrace:
                 "max_steps": self.limits.max_steps,
                 "max_cost_usd": self.limits.max_cost_usd,
                 "max_consecutive_failures": self.limits.max_consecutive_failures,
+                "max_wall_clock_seconds": self.limits.max_wall_clock_seconds,
+                "default_tool_timeout_seconds": self.limits.default_tool_timeout_seconds,
             },
             "provenance": {
                 "recorded_at": self.provenance.recorded_at,
@@ -150,6 +152,11 @@ class RunTrace:
                 max_steps=lim["max_steps"],
                 max_cost_usd=lim["max_cost_usd"],
                 max_consecutive_failures=lim["max_consecutive_failures"],
+                # `.get` with the default, not `[...]`: a trace recorded before
+                # time bounds existed must still load. A trace format that
+                # cannot read its own history is not an audit record.
+                max_wall_clock_seconds=lim.get("max_wall_clock_seconds", 300.0),
+                default_tool_timeout_seconds=lim.get("default_tool_timeout_seconds", 30.0),
             ),
             steps=tuple(
                 StepRecord(

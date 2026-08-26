@@ -11,6 +11,7 @@ the fact from logs is never quite complete enough to reconstruct a decision.
 
 from __future__ import annotations
 
+import time
 import uuid
 from dataclasses import dataclass, field
 from enum import StrEnum
@@ -36,18 +37,41 @@ class CostLimitExceededError(LimitExceededError):
         super().__init__(f"run exceeded ${limit_usd:.2f} (spent ${spent_usd:.4f})")
 
 
+class WallClockExceededError(LimitExceededError):
+    """The bound that catches a hang rather than a loop.
+
+    Step and cost ceilings only fire when the loop turns. A run blocked on a
+    downstream that never answers never reaches step two, so neither of them
+    ever fires -- which is why this one is checked first.
+    """
+
+    def __init__(self, limit_seconds: float, elapsed_seconds: float) -> None:
+        self.limit_seconds = limit_seconds
+        self.elapsed_seconds = elapsed_seconds
+        super().__init__(f"run exceeded {limit_seconds:.0f}s (elapsed {elapsed_seconds:.1f}s)")
+
+
 @dataclass(frozen=True)
 class RunLimits:
     """The bounds a run cannot exceed.
 
-    Both ceilings are required rather than optional. A default of "unlimited"
+    Every ceiling is required rather than optional. A default of "unlimited"
     is the setting nobody revisits, and the first time it matters is the
     invoice.
+
+    Four bounds, because they catch four different runaways: a loop that will
+    not terminate (`max_steps`), a run that is expensive rather than long
+    (`max_cost_usd`), an agent retrying something that will never work
+    (`max_consecutive_failures`), and a call that simply never returns
+    (`max_wall_clock_seconds`). The last is the one most harnesses omit, and
+    it is the only one that catches a hang.
     """
 
     max_steps: int = 25
     max_cost_usd: float = 1.00
     max_consecutive_failures: int = 3
+    max_wall_clock_seconds: float = 300.0
+    default_tool_timeout_seconds: float = 30.0
 
     def __post_init__(self) -> None:
         if self.max_steps < 1:
@@ -56,6 +80,15 @@ class RunLimits:
             raise ValueError("max_cost_usd must be positive")
         if self.max_consecutive_failures < 1:
             raise ValueError("max_consecutive_failures must be at least 1")
+        if self.max_wall_clock_seconds <= 0:
+            raise ValueError("max_wall_clock_seconds must be positive")
+        if self.default_tool_timeout_seconds <= 0:
+            raise ValueError("default_tool_timeout_seconds must be positive")
+        # Deliberately no cross-check that the per-call timeout fits inside the
+        # run ceiling. `RunContext.timeout_for` clamps every call to whatever
+        # the run has left, so a generous per-call default is already harmless
+        # -- and rejecting it here would make the natural
+        # `RunLimits(max_wall_clock_seconds=10)` raise on the default.
 
 
 class StepKind(StrEnum):
@@ -110,6 +143,9 @@ class RunContext:
         self.steps: list[StepRecord] = []
         self.spent_usd = 0.0
         self._consecutive_failures = 0
+        # Monotonic, not wall time: a run must not be extended or truncated by
+        # an NTP correction landing mid-flight.
+        self._started_monotonic = time.monotonic()
 
     @property
     def step_count(self) -> int:
@@ -123,8 +159,32 @@ class RunContext:
     def remaining_usd(self) -> float:
         return max(0.0, self.limits.max_cost_usd - self.spent_usd)
 
+    @property
+    def elapsed_seconds(self) -> float:
+        return time.monotonic() - self._started_monotonic
+
+    @property
+    def remaining_seconds(self) -> float:
+        return max(0.0, self.limits.max_wall_clock_seconds - self.elapsed_seconds)
+
+    def timeout_for(self, tool_timeout_seconds: float | None = None) -> float:
+        """How long one call may take, given how long the run has left.
+
+        Clamped to the remaining wall clock. Without the clamp a tool with a
+        generous per-call timeout could carry the run well past its own
+        ceiling: the bound would hold for the call and not for the run, which
+        is the same as not holding.
+        """
+        limit = tool_timeout_seconds or self.limits.default_tool_timeout_seconds
+        return min(limit, self.remaining_seconds)
+
     def before_step(self, projected_cost_usd: float = 0.0) -> None:
         """Raise if taking another step would breach a bound."""
+        # Time is checked first because it is the bound the others cannot
+        # substitute for. A run stuck on one call never turns the loop again,
+        # so no step-based or cost-based ceiling will ever fire.
+        if self.remaining_seconds <= 0:
+            raise WallClockExceededError(self.limits.max_wall_clock_seconds, self.elapsed_seconds)
         if self.step_count >= self.limits.max_steps:
             raise StepLimitExceededError(self.limits.max_steps)
         projected = self.spent_usd + projected_cost_usd
@@ -165,6 +225,7 @@ class RunOutcome(StrEnum):
     COMPLETED = "completed"
     STEP_LIMIT = "step_limit"
     COST_LIMIT = "cost_limit"
+    TIME_LIMIT = "time_limit"
     GAVE_UP = "gave_up"
     DENIED = "denied"
     # A human said no. Distinct from DENIED, which is policy refusing a call
