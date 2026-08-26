@@ -38,10 +38,10 @@ jobs:
         run: uv sync --locked --extra dev
 
       - name: Lint
-        run: uv run ruff check src tests --output-format=github
+        run: uv run ruff check src tests benchmarks --output-format=github
 
       - name: Format
-        run: uv run ruff format --check src tests
+        run: uv run ruff format --check src tests benchmarks
 
       - name: Type check
         run: uv run mypy

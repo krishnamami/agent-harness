@@ -118,6 +118,7 @@ it is the difference between a decision and a habit.
 | [0012](docs/adr/0012-a-refusal-is-terminal-for-the-sub-run.md) | A refusal is terminal for the sub-run, not for the tree |
 | [0013](docs/adr/0013-a-batch-of-calls-is-one-intent.md) | A batch of calls is one intent |
 | [0014](docs/adr/0014-the-harness-emits-spans-the-service-exports-them.md) | The harness emits spans; the service exports them |
+| [0015](docs/adr/0015-benchmarks-measure-the-harness.md) | Benchmarks measure the harness, not an agent |
 
 ---
 
@@ -343,6 +344,59 @@ between contexts without forking, so the two cannot drift apart.
 
 ---
 
+## What it costs
+
+Every number below measures **the harness**, not an agent. The tools are no-ops
+and the planner is scripted, so what is timed is the loop, the registry, the
+policy checks, the recording and the spans — nothing else. A real agent's
+latency is dominated by model calls and tool I/O, which are somebody else's
+milliseconds; the useful question about a harness is what governance costs on
+top of them.
+
+```bash
+uv run python -m benchmarks.bench
+```
+
+Measured on Python 3.11.15, Linux x86_64, 2 vCPU container. Re-run it on your
+own hardware — these are a floor, not a forecast, and quoting them without the
+machine is quoting noise.
+
+| Measurement | p50 | p95 | p99 | unit | notes |
+|---|---:|---:|---:|---|---|
+| Run setup and teardown | 66.6 | 110.1 | 176.5 | µs | plan + finish only |
+| Loop overhead, per tool call | 113.9 | 127.1 | 153.7 | µs | 25 calls/run, no-op tool |
+| Delegation, one child | 208.8 | 278.6 | 291.3 | µs | narrowing + draw + child run |
+| Record a trace | 18.3 | 31.5 | 47.1 | µs | 25-call run |
+| Serialise a trace | 18.0 | 20.2 | 45.1 | µs | 25-call run |
+| Replay a trace | 2,901.8 | 3,008.3 | 3,012.7 | µs | through the real executor |
+| 8 calls, one at a time | 43.5 | 44.5 | 44.6 | ms | 5ms tool |
+| 8 calls, one batch | 6.0 | 6.3 | 6.6 | ms | 5ms tool |
+| 50 concurrent runs | 53.7 | 61.8 | 64.3 | ms | 10 calls each, 500 calls total |
+| Per call, tracing off | 120.7 | 141.4 | 169.7 | µs | no provider installed |
+| Per call, tracing on | 324.3 | 408.2 | 486.3 | µs | `BatchSpanProcessor` |
+
+Three things worth reading off that table.
+
+**The batch path is worth 7×** on eight calls against a 5ms tool — 43.5ms to
+6.0ms. That is the justification for ADR-0013, measured rather than asserted.
+
+**Tracing costs about 200µs per call**, roughly tripling harness overhead. That
+figure is large next to a no-op tool and negligible next to a real one: against
+a tool taking 50ms it is 0.4%. "Three times slower" would be true and
+misleading, which is why the table gives the absolute number.
+
+**Replay costs about the same as the original run**, and should. ADR-0007 says
+replay goes through the real executor rather than a simulator; a replay that
+were dramatically faster would be evidence it had stopped doing that.
+
+The benchmarks are not a CI gate. A shared runner's timings are noise, and a
+performance check that goes red because another job was compiling something
+teaches people to ignore red. A smoke test keeps the script from rotting; the
+numbers get re-run deliberately when the loop changes. ADR-0015 has the rest,
+including why the span-processor choice turned out to matter more than expected.
+
+---
+
 ## What is deliberately not here
 
 A repository is defined as much by its refusals as by its contents.
@@ -371,7 +425,7 @@ A repository is defined as much by its refusals as by its contents.
 
 | Check | Result |
 |-------|--------|
-| Tests | **259 passing** |
+| Tests | **261 passing** |
 | Coverage | **97.14%**, enforced as a CI gate, floor lives in `pyproject.toml` |
 | Type checking | `mypy --strict` clean across **28 source modules** |
 | Lint / format | `ruff check` + `ruff format --check` clean |
@@ -440,7 +494,7 @@ than by testing the batch on its own. → ADR-0013
 ```bash
 uv sync --extra dev
 
-uv run pytest                          # 259 tests, coverage gate
+uv run pytest                          # 261 tests, coverage gate
 uv run mypy                            # strict, 30 modules
 uv run ruff check src tests
 ```

@@ -38,7 +38,7 @@ packages = ["src/app", "src/evals", "src/harness"]
 [tool.ruff]
 line-length = 100
 target-version = "py311"
-src = ["src", "tests"]
+src = ["src", "tests", "benchmarks"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "N", "UP", "B", "A", "C4", "SIM", "ARG", "PTH", "RUF"]
@@ -47,6 +47,9 @@ select = ["E", "F", "I", "N", "UP", "B", "A", "C4", "SIM", "ARG", "PTH", "RUF"]
 # Test doubles must match the interface they stand in for, so unused
 # arguments are the point rather than an oversight.
 "tests/**" = ["ARG002", "ARG001"]
+# Benchmark stand-ins must match the tool signature they replace, so an
+# argument they ignore is the point rather than an oversight.
+"benchmarks/**" = ["ARG001"]
 # Reference policy implementations must match the protocol signature they
 # stand in for; an argument one of them ignores is the point, not an oversight.
 "src/harness/policy.py" = ["ARG002"]
@@ -56,7 +59,7 @@ select = ["E", "F", "I", "N", "UP", "B", "A", "C4", "SIM", "ARG", "PTH", "RUF"]
 "src/harness/overlays.py" = ["ARG002"]
 
 [tool.pytest.ini_options]
-pythonpath = ["src"]
+pythonpath = ["src", "."]
 testpaths = ["tests"]
 addopts = "-q --cov=app --cov=evals --cov=harness --cov-report=term-missing --cov-fail-under=70"
 asyncio_mode = "auto"
