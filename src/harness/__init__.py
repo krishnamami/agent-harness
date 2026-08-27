@@ -25,6 +25,7 @@ from harness.gates import (
     RefuseAll,
     TierGate,
 )
+from harness.mcp import RemoteToolError, Transport, load_tools
 from harness.memory import (
     InMemoryStore,
     Memory,
@@ -126,6 +127,7 @@ __all__ = [
     "RecordingGate",
     "RefuseAll",
     "RegulatedAudit",
+    "RemoteToolError",
     "ReplayReport",
     "RiskTier",
     "RoleBasedAuthorization",
@@ -148,9 +150,11 @@ __all__ = [
     "ToolRegistry",
     "ToolSpec",
     "TraceError",
+    "Transport",
     "WallClockExceededError",
     "WorkingMemory",
     "delegate",
+    "load_tools",
     "new_child_context",
     "record_trace",
     "regulated_overlay",

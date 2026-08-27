@@ -414,6 +414,10 @@ including why the span-processor choice turned out to matter more than expected.
 
 A repository is defined as much by its refusals as by its contents.
 
+- **No transport.** `load_tools` turns a served MCP tool surface into registered
+  tools, and `Transport` is a protocol with one method. stdio, HTTP or an
+  in-process double all satisfy it; a harness that also owned a socket would be
+  two products.
 - **No model client.** The harness never calls a model. `Planner` is a protocol;
   the shipped `ScriptedPlanner` is deterministic and exists so the executor is
   testable without a network. A model-backed planner is the same interface, and
@@ -427,7 +431,10 @@ A repository is defined as much by its refusals as by its contents.
 - **No orchestration DAG.** The harness supplies delegation — one agent handing
   a sub-goal to another under narrowed authority — and stops there. Deciding
   *which* sub-goals exist, in what order, with what retries, is scheduling, and
-  a harness that also schedules is two products.
+  a harness that also schedules is two products. This is why the honest answer
+  to "why not LangGraph" is *harness inside LangGraph* rather than instead of it
+  — see [ADR-0020](docs/adr/0020-why-not-langgraph-or-crewai.md), which also
+  names what was given up, including durable resume.
 - **No registry credentials in CI.** The container is built and smoke-tested,
   never pushed. Publishing is a release concern, and a CI job holding push
   credentials is a far larger blast radius than one without.
@@ -438,8 +445,8 @@ A repository is defined as much by its refusals as by its contents.
 
 | Check | Result |
 |-------|--------|
-| Tests | **302 passing** |
-| Coverage | **97.22%**, enforced as a CI gate, floor lives in `pyproject.toml` |
+| Tests | **319 passing** |
+| Coverage | **97.42%**, enforced as a CI gate, floor lives in `pyproject.toml` |
 | Type checking | `mypy --strict` clean across **30 source modules** |
 | Lint / format | `ruff check` + `ruff format --check` clean |
 | Supply chain | `pip-audit --strict` against the exported lockfile — no known vulnerabilities |
@@ -452,7 +459,7 @@ to be kept in sync by hand.
 
 ### Bugs this design caught
 
-The tests and the ADRs are not decoration. Ten real defects, each found because
+The tests and the ADRs are not decoration. Eleven real defects, each found because
 the structure made them visible, and each with the ADR it produced. Two of them
 were guarantees this README and the source docstrings *claimed* and the code did
 not implement, which is the failure mode a repository like this exists to catch:
@@ -521,6 +528,15 @@ Invisible because every test drives `ScriptedPlanner`, where a person writes the
 arguments and writes them correctly; the hole only opens when a model produces
 them, which is the entire point. Adding validation broke none of the 286 existing
 tests. → ADR-0018
+
+**An unreadable risk tier would have meant no review.** Tools now arrive over
+MCP from `tool-registry`, and the tier arrives with them. The natural
+implementation — read `_meta.risk_tier`, fall back to the `ToolSpec` default —
+falls back to `ROUTINE`, which is exactly what `TierGate` waves through. So a
+tool whose risk the harness could *not read* would have executed with no review,
+and the tools most likely to lack metadata are the ones from an unfamiliar or
+newer server. Unknown now resolves to `CONSEQUENTIAL`: over-gating is a
+nuisance, under-gating is an incident. → ADR-0019
 
 **Batching would have been a route around the audit policy.** Redaction keyed
 off `step.tool_name`, which is `None` on a batched plan because the calls live
