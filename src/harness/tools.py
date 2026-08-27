@@ -9,6 +9,14 @@ Every tool declares a JSON Schema for its arguments. Not for documentation —
 so the harness can reject a malformed call before it reaches a real system,
 and so a model's tool-use surface is generated from the same source of truth
 that validates it.
+
+That validation happens in `check`, and it happens *before* authorisation.
+An authorisation policy is handed the arguments and is entitled to read them
+— "refunds over five hundred need a second approver" is the ordinary shape of
+one. A policy asked to judge `{"amount": "five"}`, or arguments missing
+`amount` altogether, is judging data that does not conform to the contract it
+was written against, and the usual failure is silent permission rather than a
+crash. See ADR-0018.
 """
 
 from __future__ import annotations
@@ -17,6 +25,9 @@ import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any, Protocol, runtime_checkable
+
+from jsonschema import Draft202012Validator
+from jsonschema.exceptions import SchemaError
 
 from harness.policy import AuthorizationPolicy, OpenAuthorization, Principal, RiskTier
 
@@ -46,6 +57,13 @@ class ToolSpec:
             # Tool-calling APIs universally expect an object schema at the top
             # level. Catching it here beats discovering it at inference time.
             raise ValueError(f"{self.name}: parameters must be a JSON Schema object")
+        try:
+            # A schema that is itself malformed is a defect in the tool, not in
+            # the call, and it should surface where the tool is defined rather
+            # than on the first request that happens to exercise it.
+            Draft202012Validator.check_schema(self.parameters)
+        except SchemaError as exc:
+            raise ValueError(f"{self.name}: invalid JSON Schema: {exc.message}") from exc
         if self.timeout_seconds is not None and self.timeout_seconds <= 0:
             raise ValueError(f"{self.name}: timeout_seconds must be positive")
 
@@ -61,6 +79,9 @@ class Tool(Protocol):
 class _Registered:
     spec: ToolSpec
     fn: ToolFn
+    # Compiled once at registration. Re-deriving a validator per call is
+    # invisible in a test and measurable in a loop that makes thousands.
+    validator: Draft202012Validator
 
 
 class ToolDeniedError(Exception):
@@ -75,6 +96,29 @@ class ToolDeniedError(Exception):
         self.tool_name = tool_name
         self.reason = reason
         super().__init__(f"{tool_name}: {reason}")
+
+
+class ToolArgumentError(Exception):
+    """Raised when arguments do not satisfy the tool's declared schema.
+
+    Distinct from a denial and from a failure. A denial means the caller may
+    not do this; a failure means the downstream broke; this means the call was
+    never well-formed. Only the third is something the planner can fix by
+    trying again differently, which is why it carries the specific violations
+    rather than a bare "invalid arguments" — a model handed the latter will
+    resubmit the same call.
+    """
+
+    #: Enough for a planner to correct, few enough to stay inside a prompt.
+    MAX_REPORTED = 5
+
+    def __init__(self, tool_name: str, problems: tuple[str, ...]) -> None:
+        self.tool_name = tool_name
+        self.problems = problems
+        shown = list(problems[: self.MAX_REPORTED])
+        if len(problems) > self.MAX_REPORTED:
+            shown.append(f"and {len(problems) - self.MAX_REPORTED} more")
+        super().__init__(f"{tool_name}: " + "; ".join(shown))
 
 
 class ToolNotFoundError(KeyError):
@@ -130,6 +174,25 @@ class InProcessRateLimiter:
         return True
 
 
+def _violations(validator: Draft202012Validator, arguments: dict[str, Any]) -> tuple[str, ...]:
+    """Every way these arguments miss the schema, phrased for the caller.
+
+    All of them, not the first: a planner told only about the first missing
+    field will supply it and be rejected again for the second, spending a
+    model call per field. Sorted by path so the same bad call reads the same
+    way twice -- error order is part of a replay being deterministic.
+
+    The path is included because "is not of type 'integer'" is not actionable
+    without knowing which argument. The top level is named `<root>` rather
+    than left blank, which is what an empty deque would otherwise produce.
+    """
+    problems = []
+    for error in validator.iter_errors(arguments):
+        where = ".".join(str(part) for part in error.absolute_path) or "<root>"
+        problems.append(f"{where}: {error.message}")
+    return tuple(sorted(problems))
+
+
 class ToolRegistry:
     """Holds tools, and enforces policy on the way to them.
 
@@ -156,7 +219,9 @@ class ToolRegistry:
             # Silent replacement would let a later import quietly shadow a
             # tool that policy was written against.
             raise ValueError(f"tool {spec.name!r} is already registered")
-        self._tools[spec.name] = _Registered(spec=spec, fn=fn)
+        self._tools[spec.name] = _Registered(
+            spec=spec, fn=fn, validator=Draft202012Validator(spec.parameters)
+        )
 
     @property
     def authorization(self) -> AuthorizationPolicy:
@@ -213,6 +278,11 @@ class ToolRegistry:
         Raises rather than returning a verdict: a caller that ignores a
         returned boolean is a bug that looks like working code.
 
+        Arguments are validated against the declared schema BEFORE the
+        authorisation policy sees them, so that no policy is ever asked to
+        judge arguments that do not conform to the contract it was written
+        against. See ADR-0018.
+
         Deliberately does NOT consume rate-limit budget. A rate limit is a
         budget, not a permission, and this method is documented as safe for a
         dry run and a replay -- both of which would otherwise burn today's quota
@@ -222,6 +292,10 @@ class ToolRegistry:
         if name not in self._tools:
             raise ToolNotFoundError(name)
         entry = self._tools[name]
+
+        problems = _violations(entry.validator, arguments)
+        if problems:
+            raise ToolArgumentError(name, problems)
 
         decision = self._authorization.authorize(principal, name, arguments)
         if not decision.allowed:

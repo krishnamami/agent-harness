@@ -41,6 +41,7 @@ from harness.spans import (
 )
 from harness.tools import (
     RateLimitExceededError,
+    ToolArgumentError,
     ToolDeniedError,
     ToolNotFoundError,
     ToolRegistry,
@@ -280,16 +281,30 @@ async def _loop(
             # Rate limits are no longer pre-flighted here: they are consumed
             # at call time so a dry run cannot spend them (ADR-0017). The cost
             # is that a rate-refused call reaches approval before failing.
-            except (ToolDeniedError, ToolNotFoundError) as exc:
+            except (ToolArgumentError, ToolDeniedError, ToolNotFoundError) as exc:
+                # A malformed call is filtered here for the same reason a
+                # denied one is: it cannot succeed, so a human should not be
+                # asked to approve it. Unlike a denial it is usually the
+                # planner's own mistake, so the specific violations go back in
+                # the record -- that text is the whole of the correction
+                # signal. The step is recorded as a failed TOOL_CALL, so three
+                # malformed calls in a row reach the give-up ceiling instead of
+                # looping until the step budget runs out.
                 ctx.record(
                     StepRecord(
                         index=ctx.step_count,
                         kind=StepKind.TOOL_CALL,
-                        summary=f"{call.tool} refused before review",
+                        summary=(
+                            f"{call.tool} rejected before review"
+                            if isinstance(exc, ToolArgumentError)
+                            else f"{call.tool} refused before review"
+                        ),
                         tool_name=call.tool,
                         arguments=call.arguments,
                         error=(
-                            f"denied: {exc.reason}"
+                            f"invalid arguments: {'; '.join(exc.problems)}"
+                            if isinstance(exc, ToolArgumentError)
+                            else f"denied: {exc.reason}"
                             if isinstance(exc, ToolDeniedError)
                             else f"{type(exc).__name__}: {exc}"
                         ),

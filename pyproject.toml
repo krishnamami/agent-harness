@@ -5,6 +5,12 @@ description = "Enterprise agent harness: the fabric agents run inside. Bounded e
 requires-python = ">=3.11"
 dependencies = [
     "fastapi>=0.115",
+    # Tool arguments are validated against each tool's declared schema before
+    # any policy sees them. A hand-rolled subset of JSON Schema would be the
+    # wrong kind of clever: the schemas are also what model providers consume,
+    # so "what the harness enforces" and "what the model was told" have to be
+    # the same document under the same reading of the spec.
+    "jsonschema>=4.23",
     "uvicorn[standard]>=0.32",
     "pydantic>=2.9",
     "pydantic-settings>=2.6",
@@ -26,6 +32,7 @@ dev = [
     "pytest-asyncio>=0.24",
     "ruff>=0.8",
     "mypy>=1.13",
+    "types-jsonschema>=4.23",
 ]
 
 [build-system]

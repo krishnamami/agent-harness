@@ -438,8 +438,8 @@ A repository is defined as much by its refusals as by its contents.
 
 | Check | Result |
 |-------|--------|
-| Tests | **276 passing** |
-| Coverage | **97.16%**, enforced as a CI gate, floor lives in `pyproject.toml` |
+| Tests | **302 passing** |
+| Coverage | **97.22%**, enforced as a CI gate, floor lives in `pyproject.toml` |
 | Type checking | `mypy --strict` clean across **30 source modules** |
 | Lint / format | `ruff check` + `ruff format --check` clean |
 | Supply chain | `pip-audit --strict` against the exported lockfile — no known vulnerabilities |
@@ -452,8 +452,10 @@ to be kept in sync by hand.
 
 ### Bugs this design caught
 
-The tests and the ADRs are not decoration. Four real defects, each found because
-the structure made them visible, and each with the ADR it produced:
+The tests and the ADRs are not decoration. Ten real defects, each found because
+the structure made them visible, and each with the ADR it produced. Two of them
+were guarantees this README and the source docstrings *claimed* and the code did
+not implement, which is the failure mode a repository like this exists to catch:
 
 **The give-up counter was inert.** `max_consecutive_failures` was counting every
 step, and a successful PLAN step sat between every pair of failed tool calls —
@@ -501,6 +503,24 @@ the principal it acted as, or the tier it ran at. Those live on the
 record pointed at a `child_run_id` that resolved to nothing, and ADR-0011
 contradicted ADR-0007 from the inside. Found while preparing to tag `v1.0.0`,
 which is the right moment to find it and a bad one to ship it. → ADR-0016
+
+**A dry run spent the real rate-limit budget.** `check()` consumed rate-limit
+budget, and `ReplayRegistry` subclasses the registry overriding only `call` —
+deliberately, so replay still passes through authorisation. `check` was inherited
+untouched, so **replaying a trace from March consumed today's quota**. Enough
+replays and an audit fails with `RateLimitExceededError`, for a reason that says
+nothing about the run being audited. A rate limit is a budget, and budgets are
+spent by work. → ADR-0017
+
+**Nothing ever validated tool arguments.** Every tool declares a JSON Schema, and
+this file said it existed "so the harness can reject a malformed call before it
+reaches a real system". It did not — `check()` authorised the caller and returned
+the spec without reading the arguments. A refund tool declaring `amount: integer`
+executed for `"five"`, and an undeclared `drop_tables: true` rode along untouched.
+Invisible because every test drives `ScriptedPlanner`, where a person writes the
+arguments and writes them correctly; the hole only opens when a model produces
+them, which is the entire point. Adding validation broke none of the 286 existing
+tests. → ADR-0018
 
 **Batching would have been a route around the audit policy.** Redaction keyed
 off `step.tool_name`, which is `None` on a batched plan because the calls live
