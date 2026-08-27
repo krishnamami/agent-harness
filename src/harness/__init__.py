@@ -72,6 +72,8 @@ from harness.run import (
     WallClockExceededError,
 )
 from harness.tools import (
+    InProcessRateLimiter,
+    RateLimiter,
     RateLimitExceededError,
     Tool,
     ToolDeniedError,
@@ -105,6 +107,7 @@ __all__ = [
     "Finish",
     "FourEyesGate",
     "InMemoryStore",
+    "InProcessRateLimiter",
     "LimitExceededError",
     "Memory",
     "MemoryRecord",
@@ -118,6 +121,7 @@ __all__ = [
     "Provenance",
     "PurposeAuthorization",
     "RateLimitExceededError",
+    "RateLimiter",
     "RecordingGate",
     "RefuseAll",
     "RegulatedAudit",

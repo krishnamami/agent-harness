@@ -438,9 +438,9 @@ A repository is defined as much by its refusals as by its contents.
 
 | Check | Result |
 |-------|--------|
-| Tests | **265 passing** |
+| Tests | **276 passing** |
 | Coverage | **97.16%**, enforced as a CI gate, floor lives in `pyproject.toml` |
-| Type checking | `mypy --strict` clean across **28 source modules** |
+| Type checking | `mypy --strict` clean across **30 source modules** |
 | Lint / format | `ruff check` + `ruff format --check` clean |
 | Supply chain | `pip-audit --strict` against the exported lockfile — no known vulnerabilities |
 | Secrets | `gitleaks` over full history, every run |
@@ -515,7 +515,7 @@ than by testing the batch on its own. → ADR-0013
 ```bash
 uv sync --extra dev
 
-uv run pytest                          # 265 tests, coverage gate
+uv run pytest                          # 276 tests, coverage gate
 uv run mypy                            # strict, 30 modules
 uv run ruff check src tests
 ```
@@ -544,15 +544,17 @@ from harness import (
     OpenAuthorization, Principal, RiskTier, RunContext, RunLimits,
     StandardAudit, TierGate, ToolRegistry, ToolSpec, record_trace, run_agent,
 )
+# A model-backed planner is your service's; `ScriptedPlanner` ships with the
+# harness so an executor, a policy or a tool can be tested without a network.
 
-registry = ToolRegistry(authorization=OpenAuthorization(), audit=StandardAudit())
+registry = ToolRegistry(authorization=OpenAuthorization())
 registry.register(
     ToolSpec(
         name="lookup_account",
         description="Fetch an account by id.",
-        schema={"type": "object", "properties": {"id": {"type": "string"}},
-                "required": ["id"]},
-        risk_tier=RiskTier.ELEVATED,
+        parameters={"type": "object", "properties": {"id": {"type": "string"}},
+                    "required": ["id"]},
+        tier=RiskTier.ELEVATED,
     ),
     lookup_account,
 )
@@ -562,15 +564,19 @@ ctx = RunContext(
     limits=RunLimits(max_steps=25, max_cost_usd=1.00, max_consecutive_failures=3),
 )
 
+goal = "Resolve the customer's balance query."
+
 result = await run_agent(
-    goal="Resolve the customer's balance query.",
+    goal=goal,
     planner=my_planner,
     registry=registry,
     ctx=ctx,
-    gate=TierGate(threshold=RiskTier.CONSEQUENTIAL),
+    # ApprovalGate is a protocol; `my_reviewer` is whatever your service uses to
+    # reach a human. TierGate wraps it so routine calls never get there.
+    gate=TierGate(my_reviewer, RiskTier.CONSEQUENTIAL),
 )
 
-trace = record_trace(ctx, result)      # replayable, months later
+trace = record_trace(goal, ctx, result, registry=registry, audit=StandardAudit())
 ```
 
 Four lines of that are the whole thesis. The tool declares its own risk tier.

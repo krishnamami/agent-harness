@@ -277,7 +277,10 @@ async def _loop(
         for call in calls:
             try:
                 registry.check(call.tool, call.arguments, ctx.principal)
-            except (ToolDeniedError, ToolNotFoundError, RateLimitExceededError) as exc:
+            # Rate limits are no longer pre-flighted here: they are consumed
+            # at call time so a dry run cannot spend them (ADR-0017). The cost
+            # is that a rate-refused call reaches approval before failing.
+            except (ToolDeniedError, ToolNotFoundError) as exc:
                 ctx.record(
                     StepRecord(
                         index=ctx.step_count,
@@ -523,7 +526,10 @@ async def _run_one(call: CallTool, registry: ToolRegistry, ctx: RunContext) -> S
             )
 
         try:
-            # Already checked above; calling invoke again would double-count the rate limit.
+            # Already authorised above. `call` rather than `invoke` so the
+            # permission check is not repeated; the rate limit is consumed
+            # here, which is why a replay -- which overrides `call` -- costs
+            # nothing. See ADR-0017.
             value = await asyncio.wait_for(registry.call(call.tool, call.arguments), budget)
         except TimeoutError:
             # A timeout is a failed action, not a failed run. The downstream may

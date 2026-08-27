@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import time
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Protocol, runtime_checkable
 
 from harness.policy import AuthorizationPolicy, OpenAuthorization, Principal, RiskTier
@@ -61,7 +61,6 @@ class Tool(Protocol):
 class _Registered:
     spec: ToolSpec
     fn: ToolFn
-    _calls: list[float] = field(default_factory=list)
 
 
 class ToolDeniedError(Exception):
@@ -89,6 +88,48 @@ class RateLimitExceededError(Exception):
         super().__init__(f"{tool_name}: exceeded {limit} calls/minute")
 
 
+@runtime_checkable
+class RateLimiter(Protocol):
+    """Where a tool's call budget is counted.
+
+    A contract for the same reason `MemoryStore` is one: the reference
+    implementation is correct and in-process, and in-process is wrong the
+    moment there are two replicas. Three pods each enforcing "sixty a minute"
+    permit a hundred and eighty, and the failure is silent -- the limit still
+    appears to work, and the downstream system is the one that finds out.
+
+    `allow` both checks and consumes, in that order, and returns whether the
+    call may proceed. Splitting them into check-then-record would open a race
+    that a shared backend cannot close.
+    """
+
+    async def allow(self, tool_name: str, limit_per_minute: int) -> bool: ...
+
+
+class InProcessRateLimiter:
+    """Reference implementation. Correct within one process, and only there.
+
+    Ships so a service can exercise the limit in tests and single-replica
+    deployments without standing up Redis. Anything with more than one replica
+    needs a shared implementation of the protocol above -- which is a
+    deployment decision, not a harness one.
+    """
+
+    def __init__(self, clock: Callable[[], float] = time.monotonic) -> None:
+        self._clock = clock
+        self._calls: dict[str, list[float]] = {}
+
+    async def allow(self, tool_name: str, limit_per_minute: int) -> bool:
+        now = self._clock()
+        recent = [t for t in self._calls.get(tool_name, []) if now - t < 60.0]
+        if len(recent) >= limit_per_minute:
+            self._calls[tool_name] = recent
+            return False
+        recent.append(now)
+        self._calls[tool_name] = recent
+        return True
+
+
 class ToolRegistry:
     """Holds tools, and enforces policy on the way to them.
 
@@ -97,9 +138,17 @@ class ToolRegistry:
     route is how audit trails develop holes.
     """
 
-    def __init__(self, authorization: AuthorizationPolicy | None = None) -> None:
+    def __init__(
+        self,
+        authorization: AuthorizationPolicy | None = None,
+        rate_limiter: RateLimiter | None = None,
+    ) -> None:
         self._tools: dict[str, _Registered] = {}
         self._authorization = authorization or OpenAuthorization()
+        # Defaults to in-process, which is right for one replica and wrong for
+        # two. Naming the default here is what makes that a choice rather than
+        # a surprise.
+        self._rate_limiter: RateLimiter = rate_limiter or InProcessRateLimiter()
 
     # ---------------------------------------------------------------- register
     def register(self, spec: ToolSpec, fn: ToolFn) -> None:
@@ -163,6 +212,12 @@ class ToolRegistry:
 
         Raises rather than returning a verdict: a caller that ignores a
         returned boolean is a bug that looks like working code.
+
+        Deliberately does NOT consume rate-limit budget. A rate limit is a
+        budget, not a permission, and this method is documented as safe for a
+        dry run and a replay -- both of which would otherwise burn today's quota
+        re-examining a run from March, and eventually fail for a reason that has
+        nothing to do with the run being replayed.
         """
         if name not in self._tools:
             raise ToolNotFoundError(name)
@@ -172,31 +227,35 @@ class ToolRegistry:
         if not decision.allowed:
             raise ToolDeniedError(name, decision.reason or "denied by policy")
 
-        self._check_rate_limit(entry)
         return entry.spec
 
     async def call(self, name: str, arguments: dict[str, Any]) -> Any:
         """Run a tool that has already passed `check`.
 
-        Deliberately takes no principal: it performs no policy of its own, and
-        a signature that suggested otherwise would invite someone to call it
-        directly. The only legitimate caller is one that has just checked.
+        Deliberately takes no principal: it performs no AUTHORISATION policy of
+        its own, and a signature that suggested otherwise would invite someone
+        to call it directly. The only legitimate caller is one that has just
+        checked.
+
+        It does consume rate-limit budget, because this is where the tool
+        actually runs and a budget should be spent by work rather than by
+        asking whether work would be permitted. `ReplayRegistry` overrides this
+        method entirely, so a replay costs nothing.
+
+        The trade-off: a call refused for rate rather than policy now fails
+        after any approval it needed, instead of being filtered out before it.
+        That wastes an approval in the rare case, and it is the price of a rate
+        limit that means what it says. See ADR-0017.
         """
         if name not in self._tools:
             raise ToolNotFoundError(name)
+        spec = self._tools[name].spec
+        limit = spec.rate_limit_per_minute
+        if limit is not None and not await self._rate_limiter.allow(name, limit):
+            raise RateLimitExceededError(name, limit)
         return await self._tools[name].fn(arguments)
 
     async def invoke(self, name: str, arguments: dict[str, Any], principal: Principal) -> Any:
         """Check and call. Convenience for callers with nothing to do between."""
         self.check(name, arguments, principal)
         return await self.call(name, arguments)
-
-    def _check_rate_limit(self, entry: _Registered) -> None:
-        limit = entry.spec.rate_limit_per_minute
-        if limit is None:
-            return
-        now = time.monotonic()
-        entry._calls = [t for t in entry._calls if now - t < 60.0]
-        if len(entry._calls) >= limit:
-            raise RateLimitExceededError(entry.spec.name, limit)
-        entry._calls.append(now)
