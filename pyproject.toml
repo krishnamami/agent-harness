@@ -11,7 +11,7 @@ dependencies = [
     # so "what the harness enforces" and "what the model was told" have to be
     # the same document under the same reading of the spec.
     "jsonschema>=4.23",
-    "uvicorn[standard]>=0.32",
+    "uvicorn[standard]>=0.52.4",
     "pydantic>=2.9",
     "pydantic-settings>=2.6",
     # The harness imports the *API* only: `get_tracer` is a no-op until a
