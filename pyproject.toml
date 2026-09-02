@@ -12,7 +12,7 @@ dependencies = [
     # the same document under the same reading of the spec.
     "jsonschema>=4.23",
     "uvicorn[standard]>=0.32",
-    "pydantic>=2.9",
+    "pydantic>=2.13.5",
     "pydantic-settings>=2.6",
     # The harness imports the *API* only: `get_tracer` is a no-op until a
     # service installs a provider. Declared explicitly rather than leaned on
@@ -30,7 +30,7 @@ dev = [
     "pytest-cov>=6.0",
     "httpx>=0.27",
     "pytest-asyncio>=0.24",
-    "ruff>=0.8",
+    "ruff>=0.16.5",
     "mypy>=1.13",
     "types-jsonschema>=4.23",
 ]
