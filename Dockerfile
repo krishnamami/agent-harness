@@ -5,7 +5,7 @@
 # Nothing from this stage reaches the final image except /app/.venv, so the
 # compilers, caches and uv binary never ship.
 # ---------------------------------------------------------------------------
-FROM python:3.12-slim-bookworm AS builder
+FROM python:3.14-slim-bookworm AS builder
 
 # uv is pinned. "latest" in a build stage means the image you ship on Friday
 # was not built by the same toolchain as the one you tested on Monday.
@@ -32,7 +32,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 # ---------------------------------------------------------------------------
 # Stage 2 - runtime.
 # ---------------------------------------------------------------------------
-FROM python:3.12-slim-bookworm AS runtime
+FROM python:3.14-slim-bookworm AS runtime
 
 # A fixed uid/gid, not a name. Kubernetes runAsUser takes a number, and
 # matching it to the image's user is what keeps a read-only mount working.
